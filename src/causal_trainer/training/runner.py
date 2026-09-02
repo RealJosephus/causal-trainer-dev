@@ -3,15 +3,51 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import time
 from collections import deque
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from tqdm.auto import tqdm
 
 from ..checkpointing.bundles import ResumeCheckpoint
 from .arguments import TrainingArguments, parse_args
+
+_PROCESSOR_ALLOW_PATTERNS = (
+    "*.json",
+    "*.jinja",
+    "chat_templates/*.jinja",
+    "*.model",
+    "*.tiktoken",
+    "*.txt",
+)
+
+
+def _resolve_processor_source(
+    repo_id_or_path: str | Path,
+    *,
+    revision: str | None,
+    token: str | None,
+) -> Path:
+    """Resolve tokenizer assets without downloading another model's weights."""
+
+    candidate = Path(repo_id_or_path).expanduser()
+    if candidate.exists():
+        if not candidate.is_dir():
+            raise ValueError(f"processor source must be a directory, got {candidate}")
+        return candidate.resolve()
+
+    from huggingface_hub import snapshot_download
+
+    return Path(
+        snapshot_download(
+            repo_id=str(repo_id_or_path),
+            revision=revision,
+            token=token,
+            allow_patterns=list(_PROCESSOR_ALLOW_PATTERNS),
+        )
+    )
 
 
 def _jsonable_arguments(args: TrainingArguments) -> dict[str, Any]:
@@ -28,6 +64,47 @@ def _distributed_arguments_digest(args: TrainingArguments) -> bytes:
     values.pop("local_device_ids", None)
     encoded = json.dumps(values, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).digest()
+
+
+def _prepared_tokenizer_digest(
+    source: str | Path,
+    filenames: Any,
+) -> str:
+    """Hash the exact tokenizer files recorded by the offline command."""
+
+    if not isinstance(filenames, list) or not filenames:
+        raise ValueError("prepared tokenizer metadata must list its files")
+    root = Path(source).resolve()
+    digest = hashlib.sha256()
+    for filename in filenames:
+        if not isinstance(filename, str) or not filename:
+            raise ValueError("prepared tokenizer filenames must be non-empty strings")
+        relative = PurePosixPath(filename)
+        if (
+            "\\" in filename
+            or relative.is_absolute()
+            or PureWindowsPath(filename).drive
+            or str(relative) != filename
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ValueError(
+                f"prepared tokenizer filename escapes its source: {filename!r}"
+            )
+        # Keep the containment check lexical. Hugging Face snapshot files are
+        # normally symlinks whose resolved targets live in the sibling blobs
+        # directory, and following those links is both expected and safe here.
+        path = root.joinpath(*relative.parts)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"prepared tokenizer file is missing from the training processor: {path}"
+            )
+        encoded = filename.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "little", signed=False))
+        digest.update(encoded)
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _validate_supported_config(
@@ -104,7 +181,8 @@ def _validate_supported_config(
     if args.max_sequence_length > config.max_position_embeddings:
         raise ValueError("max_sequence_length exceeds the checkpoint's max_position_embeddings")
     if (
-        args.endprompt_enable
+        args.dataset_format == "raw"
+        and args.endprompt_enable
         and args.effective_endprompt_logical_length > config.max_position_embeddings
     ):
         raise ValueError("EndPrompt logical length exceeds the checkpoint's max_position_embeddings")
@@ -136,6 +214,11 @@ def _validate_supported_config(
     ]
     if fsdp_conflicts:
         raise ValueError(f"FSDP={fsdp} does not divide: " + ", ".join(fsdp_conflicts))
+    if args.lora and args.lora_rank % fsdp:
+        raise ValueError(
+            f"lora_rank={args.lora_rank} must be divisible by FSDP={fsdp} "
+            "because FSDP shards the LoRA rank axis"
+        )
     sequence_parallel = int(mesh.shape["sp"])
     if args.max_sequence_length % sequence_parallel:
         raise ValueError(
@@ -280,6 +363,26 @@ def _project_streaming_progress_total(
     )
 
 
+def _prepared_streaming_limits(
+    rows_per_epoch: int,
+    effective_batch_size: int,
+    epochs: float,
+    max_steps: int,
+) -> tuple[int, int | None]:
+    """Return the exact optimizer cap and source epochs for prepared streaming."""
+
+    if rows_per_epoch <= 0 or effective_batch_size <= 0:
+        raise ValueError("prepared streaming rows and batch size must be positive")
+    steps_per_epoch = math.ceil(rows_per_epoch / effective_batch_size)
+    if max_steps > 0:
+        return max_steps, None
+    if epochs <= 0:
+        raise ValueError("prepared streaming epochs must be positive without max_steps")
+    total_steps = max(1, math.floor(steps_per_epoch * epochs))
+    source_epochs = max(1, math.ceil(total_steps / steps_per_epoch))
+    return total_steps, source_epochs
+
+
 def _block_metric_tree(jax_module: Any, metrics: Any) -> Any:
     """Synchronize a device metric pytree without copying it to the host."""
 
@@ -332,16 +435,19 @@ def _resume_signature_payload(
     preprocessing_process_count: int,
     prepared_real_rows: int,
     prepared_dummy_rows: int,
+    prepared_revision: str | None = None,
 ) -> dict[str, Any]:
     argument_names = (
         "repo_id",
         "dataset_name",
+        "dataset_format",
         "dataset_config_name",
         "dataset_revision",
         "dataset_split",
         "dataset_streaming",
         "dataset_text_field",
         "processor_repo_id",
+        "processor_revision",
         "revision",
         "max_sequence_length",
         "packing",
@@ -389,8 +495,9 @@ def _resume_signature_payload(
         "sharding_axis",
         "sharding_dcn_axis",
     )
-    return {
-        "arguments": {name: getattr(args, name) for name in argument_names},
+    arguments = {name: getattr(args, name) for name in argument_names}
+    payload = {
+        "arguments": arguments,
         "dataset_fingerprint": getattr(dataset, "_fingerprint", None),
         "preprocessing_process_count": preprocessing_process_count,
         "prepared_real_rows": prepared_real_rows,
@@ -400,10 +507,13 @@ def _resume_signature_payload(
         "plan": dataclasses.asdict(plan),
         "streaming_scheduler_policy": (
             _STREAMING_SCHEDULE_POLICY
-            if args.dataset_streaming and args.max_steps <= 0
+            if args.uses_raw_streaming and args.max_steps <= 0
             else None
         ),
     }
+    if args.dataset_format == "prepared":
+        payload["prepared_revision"] = prepared_revision
+    return payload
 
 
 def _resume_action(
@@ -521,6 +631,12 @@ def main(argv: list[str] | None = None) -> None:
         select_process_shard,
         source_dataset_identity,
     )
+    from ..data.prepared import (
+        iter_prepared_streaming_batches,
+        load_prepared_dataset,
+        load_prepared_manifest,
+        resolve_prepared_revision,
+    )
     from ..data.preprocessing import EndPromptSettings
     from ..data.streaming import iter_streaming_batches, streaming_dataset_metadata
     from ..data.streaming_batching import (
@@ -585,6 +701,8 @@ def main(argv: list[str] | None = None) -> None:
     is_primary = jax.process_index() == 0
     logger = configure_logging(is_primary)
     mesh = create_mesh(args.sharding_axis, dcn_axis_dims=args.sharding_dcn_axis)
+    raw_streaming = args.uses_raw_streaming
+    dataset_uses_assistant_loss_mask = args.uses_assistant_loss_mask
     logger.info("JAX backend=%s global_devices=%d mesh=%s", jax.default_backend(), jax.device_count(), mesh.shape)
     full_frozen_components = () if args.lora else args.frozen_parameter_components
     trainable_lm_head = (
@@ -613,33 +731,47 @@ def main(argv: list[str] | None = None) -> None:
         trainable_lm_head,
     )
 
-    model_source = retry_hf_call(
-        lambda: resolve_hf_source(
-            args.repo_id,
-            revision=args.revision,
-            token=args.token,
-        ),
-        initial_delay=args.hf_retry_initial_delay,
-        max_delay=args.hf_retry_max_delay,
-        operation="resolving the model repository",
-    )
-    processor_source = (
-        model_source
-        if args.processor_repo_id is None or args.processor_repo_id == args.repo_id
-        else retry_hf_call(
+    model_source = None
+    processor_source = None
+    raw_config = None
+    config = None
+    model_source_error = None
+    try:
+        model_source = retry_hf_call(
             lambda: resolve_hf_source(
-                args.processor_repo_id,
+                args.repo_id,
                 revision=args.revision,
                 token=args.token,
             ),
             initial_delay=args.hf_retry_initial_delay,
             max_delay=args.hf_retry_max_delay,
-            operation="resolving the tokenizer repository",
+            operation="resolving the model repository",
         )
+        processor_source = (
+            model_source
+            if args.processor_repo_id is None
+            else retry_hf_call(
+                lambda: _resolve_processor_source(
+                    args.processor_repo_id,
+                    revision=args.effective_processor_revision,
+                    token=args.token,
+                ),
+                initial_delay=args.hf_retry_initial_delay,
+                max_delay=args.hf_retry_max_delay,
+                operation="resolving the tokenizer repository",
+            )
+        )
+        raw_config = load_hf_config(model_source)
+        config = ModelConfig.from_dict(raw_config)
+        _validate_supported_config(raw_config, config, args, mesh)
+    except Exception as exc:
+        model_source_error = exc
+    _raise_if_any_process_error(
+        "resolving and validating model/processor sources",
+        model_source_error,
     )
-    raw_config = load_hf_config(model_source)
-    config = ModelConfig.from_dict(raw_config)
-    _validate_supported_config(raw_config, config, args, mesh)
+    if model_source is None or processor_source is None or raw_config is None or config is None:
+        raise RuntimeError("model/processor source setup failed without a reported error")
     param_dtype = jnp.bfloat16 if args.param_dtype == "bfloat16" else jnp.float32
     compute_dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
     template = parameter_shapes(config, param_dtype)
@@ -674,16 +806,18 @@ def main(argv: list[str] | None = None) -> None:
             revision=args.revision,
         )
 
-    tokenizer = TrainingTokenizer.from_directory(processor_source)
-    tokenizer.validate_model_vocabulary(config.vocab_size)
-    # A tokenizer may intentionally use a padding token distinct from the
-    # model config's historical pad ID. Preserve it when defined; the model's
-    # ID is only a fallback, matching the established training behavior.
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = config.pad_token_id
+    tokenizer = None
+    if args.dataset_format == "raw":
+        tokenizer = TrainingTokenizer.from_directory(processor_source)
+        tokenizer.validate_model_vocabulary(config.vocab_size)
+        # A tokenizer may intentionally use a padding token distinct from the
+        # model config's historical pad ID. Preserve it when defined; the model's
+        # ID is only a fallback, matching the established training behavior.
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = config.pad_token_id
 
     endprompt = None
-    if args.endprompt_enable:
+    if args.endprompt_enable and args.dataset_format == "raw":
         endprompt = EndPromptSettings(
             logical_length_min=args.effective_endprompt_logical_length_min,
             logical_length_max=args.effective_endprompt_logical_length,
@@ -692,22 +826,113 @@ def main(argv: list[str] | None = None) -> None:
             context_loss_weight=args.endprompt_context_loss_weight,
         )
 
+    prepared_manifest = None
+    prepared_revision = None
     source_dataset = None
     source_load_error = None
     try:
-        source_dataset = retry_hf_call(
-            lambda: load_training_split(
-                args.dataset_name,
-                args.dataset_split,
-                token=args.token,
-                config_name=args.dataset_config_name,
-                revision=args.dataset_revision,
-                streaming=args.dataset_streaming,
-            ),
-            initial_delay=args.hf_retry_initial_delay,
-            max_delay=args.hf_retry_max_delay,
-            operation="loading the training dataset",
-        )
+        if args.dataset_format == "prepared":
+            prepared_revision = retry_hf_call(
+                lambda: resolve_prepared_revision(
+                    args.dataset_name,
+                    token=args.token,
+                    revision=args.dataset_revision,
+                ),
+                initial_delay=args.hf_retry_initial_delay,
+                max_delay=args.hf_retry_max_delay,
+                operation="resolving the prepared dataset revision",
+            )
+            prepared_manifest = retry_hf_call(
+                lambda: load_prepared_manifest(
+                    args.dataset_name,
+                    token=args.token,
+                    revision=prepared_revision,
+                ),
+                initial_delay=args.hf_retry_initial_delay,
+                max_delay=args.hf_retry_max_delay,
+                operation="loading the prepared dataset manifest",
+            )
+            if prepared_manifest.split != args.dataset_split:
+                raise ValueError(
+                    f"prepared dataset split is {prepared_manifest.split!r}, "
+                    f"but --dataset_split is {args.dataset_split!r}"
+                )
+            if prepared_manifest.max_sequence_length != args.max_sequence_length:
+                raise ValueError(
+                    "prepared max_sequence_length="
+                    f"{prepared_manifest.max_sequence_length} does not match training "
+                    f"max_sequence_length={args.max_sequence_length}"
+                )
+            tokenizer_metadata = prepared_manifest.tokenizer
+            expected_tokenizer_digest = tokenizer_metadata.get("sha256")
+            if not isinstance(expected_tokenizer_digest, str):
+                raise ValueError(
+                    "prepared tokenizer metadata is missing its sha256 digest"
+                )
+            actual_tokenizer_digest = _prepared_tokenizer_digest(
+                processor_source,
+                tokenizer_metadata.get("files"),
+            )
+            if actual_tokenizer_digest != expected_tokenizer_digest:
+                raise ValueError(
+                    "the training processor tokenizer files do not match the "
+                    "tokenizer used by causal-prepare"
+                )
+            tokenizer_vocab_size = tokenizer_metadata.get("vocab_size")
+            if (
+                type(tokenizer_vocab_size) is not int
+                or tokenizer_vocab_size <= 0
+                or tokenizer_vocab_size > config.vocab_size
+            ):
+                raise ValueError(
+                    "prepared tokenizer vocab_size must be positive and no greater "
+                    f"than model vocab_size={config.vocab_size}"
+                )
+            if prepared_manifest.max_token_id >= config.vocab_size:
+                raise ValueError(
+                    f"prepared token id {prepared_manifest.max_token_id} is outside "
+                    f"model vocab_size={config.vocab_size}"
+                )
+            if prepared_manifest.max_position_id >= config.max_position_embeddings:
+                raise ValueError(
+                    f"prepared position id {prepared_manifest.max_position_id} is outside "
+                    f"model max_position_embeddings={config.max_position_embeddings}"
+                )
+            dataset_uses_assistant_loss_mask = (
+                prepared_manifest.uses_assistant_loss_mask
+            )
+            source_dataset = retry_hf_call(
+                lambda: load_prepared_dataset(
+                    args.dataset_name,
+                    prepared_manifest,
+                    token=args.token,
+                    revision=prepared_revision,
+                    streaming=args.dataset_streaming,
+                    process_index=(
+                        None if args.dataset_streaming else jax.process_index()
+                    ),
+                    process_count=(
+                        None if args.dataset_streaming else jax.process_count()
+                    ),
+                ),
+                initial_delay=args.hf_retry_initial_delay,
+                max_delay=args.hf_retry_max_delay,
+                operation="loading the assigned prepared dataset files",
+            )
+        else:
+            source_dataset = retry_hf_call(
+                lambda: load_training_split(
+                    args.dataset_name,
+                    args.dataset_split,
+                    token=args.token,
+                    config_name=args.dataset_config_name,
+                    revision=args.dataset_revision,
+                    streaming=args.dataset_streaming,
+                ),
+                initial_delay=args.hf_retry_initial_delay,
+                max_delay=args.hf_retry_max_delay,
+                operation="loading the training dataset",
+            )
     except Exception as exc:
         source_load_error = exc
     _raise_if_any_process_error("loading the training dataset", source_load_error)
@@ -716,7 +941,7 @@ def main(argv: list[str] | None = None) -> None:
 
     streaming_metadata = None
     metadata_error = None
-    if args.dataset_streaming:
+    if args.dataset_streaming and prepared_manifest is None:
         try:
             streaming_metadata = retry_hf_call(
                 lambda: streaming_dataset_metadata(
@@ -731,7 +956,13 @@ def main(argv: list[str] | None = None) -> None:
             metadata_error = exc
     _raise_if_any_process_error("reading streaming dataset metadata", metadata_error)
     source_examples_per_epoch = (
-        streaming_metadata.num_examples if streaming_metadata is not None else None
+        prepared_manifest.total_rows
+        if args.dataset_streaming and prepared_manifest is not None
+        else (
+            streaming_metadata.num_examples
+            if streaming_metadata is not None
+            else None
+        )
     )
 
     if jax.process_count() > 1:
@@ -739,7 +970,21 @@ def main(argv: list[str] | None = None) -> None:
         try:
             from jax.experimental import multihost_utils
 
-            if args.dataset_streaming:
+            if prepared_manifest is not None:
+                identity = np.frombuffer(
+                    hashlib.sha256(
+                        json.dumps(
+                            {
+                                "manifest": prepared_manifest.global_digest,
+                                "revision": prepared_revision,
+                            },
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ).encode("utf-8")
+                    ).digest(),
+                    dtype=np.uint8,
+                ).copy()
+            elif args.dataset_streaming:
                 features = getattr(source_dataset, "features", None)
                 if hasattr(features, "to_dict"):
                     features = features.to_dict()
@@ -773,32 +1018,70 @@ def main(argv: list[str] | None = None) -> None:
             source_identity_error = exc
         _raise_if_any_process_error("checking the source dataset identity", source_identity_error)
 
+    prepared_stream_num_epochs = None
     if args.dataset_streaming:
         dataset = source_dataset
         prepared_real_rows = 0
         prepared_dummy_rows = 0
         local_prepared_rows = 0
-        plan = StreamingBatchPlan.create(
-            source_examples_per_epoch,
-            args.total_batch_size,
-            args.gradient_accumulation_steps,
-            int(args.num_train_epochs),
-            args.max_steps,
-        )
+        if prepared_manifest is not None:
+            prepared_total_steps, prepared_stream_num_epochs = (
+                _prepared_streaming_limits(
+                    prepared_manifest.total_rows,
+                    args.effective_batch_size,
+                    args.num_train_epochs,
+                    args.max_steps,
+                )
+            )
+            # A prepared manifest has an exact row count. Reuse the streaming
+            # envelope/checkpoint machinery with an exact optimizer-step cap,
+            # rather than the estimate-driven raw streaming horizon.
+            plan = StreamingBatchPlan.create(
+                prepared_manifest.total_rows,
+                args.total_batch_size,
+                args.gradient_accumulation_steps,
+                prepared_stream_num_epochs or 1,
+                prepared_total_steps,
+            )
+            if args.shuffle:
+                prepared_fields = 6 if prepared_manifest.uses_assistant_loss_mask else 5
+                approximate_shuffle_bytes = (
+                    args.streaming_shuffle_buffer
+                    * prepared_manifest.max_sequence_length
+                    * prepared_fields
+                    * 4
+                )
+                if approximate_shuffle_bytes >= 512 * 1024**2:
+                    logger.warning(
+                        "prepared streaming shuffle may retain about %.1f GiB of "
+                        "decoded rows; use --no-shuffle or lower "
+                        "--streaming_shuffle_buffer",
+                        approximate_shuffle_bytes / 1024**3,
+                    )
+        else:
+            plan = StreamingBatchPlan.create(
+                source_examples_per_epoch,
+                args.total_batch_size,
+                args.gradient_accumulation_steps,
+                int(args.num_train_epochs),
+                args.max_steps,
+            )
         if jax.process_count() > 1:
             logger.info(
                 "streaming input is deterministically reproduced on every JAX process; "
                 "each global source record is still counted and trained exactly once"
             )
         logger.info(
-            "streaming_source_examples_per_epoch_estimate=%s "
-            "estimated_steps_per_epoch=%s effective_global_batch=%d "
+            "streaming_source_examples_per_epoch_%s=%s "
+            "steps_per_epoch_%s=%s effective_global_batch=%d "
             "shuffle_buffer=%d mode=%s",
+            "exact" if prepared_manifest is not None else "estimate",
             (
                 source_examples_per_epoch
                 if source_examples_per_epoch is not None
                 else "unknown"
             ),
+            "exact" if prepared_manifest is not None else "estimate",
             plan.steps_per_epoch if plan.steps_per_epoch is not None else "unknown",
             plan.effective_batch_size,
             args.streaming_shuffle_buffer,
@@ -817,55 +1100,82 @@ def main(argv: list[str] | None = None) -> None:
             ),
         )
     else:
-        source_shard = None
-        source_start = 0
-        shard_error = None
-        try:
-            if args.preprocessing_mode == "shard_then_merge":
-                source_shard, source_start = select_process_shard(
-                    source_dataset,
-                    process_index=jax.process_index(),
-                    process_count=jax.process_count(),
-                )
-            else:
-                source_shard = source_dataset
-        except Exception as exc:
-            shard_error = exc
-        _raise_if_any_process_error("selecting the local preprocessing shard", shard_error)
-        if source_shard is None:
-            raise RuntimeError("source dataset sharding failed without a reported error")
-        del source_dataset
-
         local_columns = None
         local_preparation_error = None
-        try:
-            prepared_shard = prepare_training_dataset(
-                source_shard,
-                tokenizer,
-                dataset_text_field=args.dataset_text_field,
-                max_sequence_length=args.max_sequence_length,
-                assistant_only_loss=args.assistant_only_loss,
-                last_assistant_only_loss=args.last_assistant_only_loss,
-                endprompt=endprompt,
-                packing=args.packing,
-                packing_batch_size=args.packing_batch_size,
-                preprocessing_num_workers=args.preprocessing_num_workers,
-                example_index_offset=source_start,
-                allow_empty=args.preprocessing_mode == "shard_then_merge",
+        if prepared_manifest is not None:
+            try:
+                local_columns = packed_dataset_to_arrays(
+                    source_dataset,
+                    max_sequence_length=args.max_sequence_length,
+                    assistant_only_loss=(
+                        prepared_manifest.uses_assistant_loss_mask
+                    ),
+                )
+            except Exception as exc:
+                local_preparation_error = exc
+            _raise_if_any_process_error(
+                "reading canonical prepared dataset columns",
+                local_preparation_error,
             )
-            local_columns = packed_dataset_to_arrays(
-                prepared_shard,
-                max_sequence_length=args.max_sequence_length,
-                assistant_only_loss=args.assistant_only_loss,
-                last_assistant_only_loss=args.last_assistant_only_loss,
+            del source_dataset
+        else:
+            source_shard = None
+            source_start = 0
+            shard_error = None
+            try:
+                if args.preprocessing_mode == "shard_then_merge":
+                    source_shard, source_start = select_process_shard(
+                        source_dataset,
+                        process_index=jax.process_index(),
+                        process_count=jax.process_count(),
+                    )
+                else:
+                    source_shard = source_dataset
+            except Exception as exc:
+                shard_error = exc
+            _raise_if_any_process_error(
+                "selecting the local preprocessing shard",
+                shard_error,
             )
-            del prepared_shard
-        except Exception as exc:
-            local_preparation_error = exc
-        _raise_if_any_process_error("tokenizing and packing the local dataset", local_preparation_error)
+            if source_shard is None:
+                raise RuntimeError(
+                    "source dataset sharding failed without a reported error"
+                )
+            del source_dataset
+
+            try:
+                if tokenizer is None:
+                    raise RuntimeError("raw preprocessing requires a tokenizer")
+                prepared_shard = prepare_training_dataset(
+                    source_shard,
+                    tokenizer,
+                    dataset_text_field=args.dataset_text_field,
+                    max_sequence_length=args.max_sequence_length,
+                    assistant_only_loss=args.assistant_only_loss,
+                    last_assistant_only_loss=args.last_assistant_only_loss,
+                    endprompt=endprompt,
+                    packing=args.packing,
+                    packing_batch_size=args.packing_batch_size,
+                    preprocessing_num_workers=args.preprocessing_num_workers,
+                    example_index_offset=source_start,
+                    allow_empty=args.preprocessing_mode == "shard_then_merge",
+                )
+                local_columns = packed_dataset_to_arrays(
+                    prepared_shard,
+                    max_sequence_length=args.max_sequence_length,
+                    assistant_only_loss=args.assistant_only_loss,
+                    last_assistant_only_loss=args.last_assistant_only_loss,
+                )
+                del prepared_shard
+            except Exception as exc:
+                local_preparation_error = exc
+            _raise_if_any_process_error(
+                "tokenizing and packing the local dataset",
+                local_preparation_error,
+            )
+            del source_shard
         if local_columns is None:
             raise RuntimeError("local dataset preparation failed without a reported error")
-        del source_shard
 
         local_prepared_rows = next(iter(local_columns.values())).shape[0]
         merged_columns = None
@@ -873,7 +1183,10 @@ def main(argv: list[str] | None = None) -> None:
         try:
             merged_columns = (
                 merge_packed_host_arrays(local_columns)
-                if args.preprocessing_mode == "shard_then_merge"
+                if (
+                    prepared_manifest is not None
+                    or args.preprocessing_mode == "shard_then_merge"
+                )
                 else local_columns
             )
         except Exception as exc:
@@ -929,7 +1242,11 @@ def main(argv: list[str] | None = None) -> None:
             plan.steps_per_epoch,
             plan.total_steps,
             plan.effective_batch_size,
-            args.preprocessing_mode,
+            (
+                "prepared_files"
+                if prepared_manifest is not None
+                else args.preprocessing_mode
+            ),
             (
                 "lora+embed+head"
                 if args.lora and args.lora_train_embed_and_lm_head
@@ -961,15 +1278,20 @@ def main(argv: list[str] | None = None) -> None:
             args,
             config,
             plan,
-            dataset,
+            prepared_manifest if prepared_manifest is not None else dataset,
             mesh,
             preprocessing_process_count=(
                 jax.process_count()
-                if not args.dataset_streaming and args.preprocessing_mode == "shard_then_merge"
+                if (
+                    args.dataset_format == "raw"
+                    and not args.dataset_streaming
+                    and args.preprocessing_mode == "shard_then_merge"
+                )
                 else 1
             ),
             prepared_real_rows=prepared_real_rows,
             prepared_dummy_rows=prepared_dummy_rows,
+            prepared_revision=prepared_revision,
         )
     )
     resume_checkpoint = None
@@ -1181,12 +1503,12 @@ def main(argv: list[str] | None = None) -> None:
             trainable_param_shardings = base_param_shardings
 
         source_progress_schedule = (
-            args.dataset_streaming
+            raw_streaming
             and args.max_steps <= 0
             and plan.total_source_examples is not None
         )
         streaming_schedule_without_total = (
-            args.dataset_streaming
+            raw_streaming
             and args.max_steps <= 0
             and plan.total_source_examples is None
         )
@@ -1310,7 +1632,7 @@ def main(argv: list[str] | None = None) -> None:
             "loss_implementation": loss_implementation,
             "mlp_chunk_size": args.mlp_chunk_size,
             "scan_layers": args.scan_layers,
-            "sparse_loss_skip": args.uses_assistant_loss_mask,
+            "sparse_loss_skip": dataset_uses_assistant_loss_mask,
             "optimizer_state_shardings": optimizer_state_shardings,
             "batch_named_sharding": input_sharding,
             "replicated_named_sharding": scalar_sharding,
@@ -1461,30 +1783,49 @@ def main(argv: list[str] | None = None) -> None:
                 set_epoch(epoch)
             return stream
 
-        pad_token_id = tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = tokenizer.eos_token_id
-        if pad_token_id is None:
-            raise ValueError("the tokenizer must define pad_token_id or eos_token_id")
-        packing_windows = iter_streaming_batches(
-            streaming_source_factory,
-            tokenizer,
-            num_epochs=plan.epochs,
-            dataset_text_field=args.dataset_text_field,
-            max_sequence_length=args.max_sequence_length,
-            pad_token_id=int(pad_token_id),
-            assistant_only_loss=args.assistant_only_loss,
-            last_assistant_only_loss=args.last_assistant_only_loss,
-            endprompt=endprompt,
-            packing=args.packing,
-            packing_batch_size=args.packing_batch_size,
-            retry_initial_delay=args.hf_retry_initial_delay,
-            retry_max_delay=args.hf_retry_max_delay,
-        )
+        if prepared_manifest is not None:
+            packing_windows = iter_prepared_streaming_batches(
+                streaming_source_factory,
+                prepared_stream_num_epochs,
+                prepared_manifest.total_rows,
+                prepared_manifest.max_sequence_length,
+                retry_initial_delay=args.hf_retry_initial_delay,
+                retry_max_delay=args.hf_retry_max_delay,
+                uses_assistant_loss_mask=(
+                    prepared_manifest.uses_assistant_loss_mask
+                ),
+                max_token_id=prepared_manifest.max_token_id,
+                max_position_id=prepared_manifest.max_position_id,
+            )
+        else:
+            if tokenizer is None:
+                raise RuntimeError("raw streaming requires a tokenizer")
+            pad_token_id = tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = tokenizer.eos_token_id
+            if pad_token_id is None:
+                raise ValueError(
+                    "the tokenizer must define pad_token_id or eos_token_id"
+                )
+            packing_windows = iter_streaming_batches(
+                streaming_source_factory,
+                tokenizer,
+                num_epochs=plan.epochs,
+                dataset_text_field=args.dataset_text_field,
+                max_sequence_length=args.max_sequence_length,
+                pad_token_id=int(pad_token_id),
+                assistant_only_loss=args.assistant_only_loss,
+                last_assistant_only_loss=args.last_assistant_only_loss,
+                endprompt=endprompt,
+                packing=args.packing,
+                packing_batch_size=args.packing_batch_size,
+                retry_initial_delay=args.hf_retry_initial_delay,
+                retry_max_delay=args.hf_retry_max_delay,
+            )
         host_batches = iter_streaming_global_batches(
             packing_windows,
             plan,
-            assistant_only_loss=args.uses_assistant_loss_mask,
+            assistant_only_loss=dataset_uses_assistant_loss_mask,
             start_step=start_step,
             expected_source_examples_before=(
                 resume_checkpoint.source_examples_seen
@@ -1599,7 +1940,7 @@ def main(argv: list[str] | None = None) -> None:
         host_batches = iter_global_batches(
             dataset,
             plan,
-            assistant_only_loss=args.uses_assistant_loss_mask,
+            assistant_only_loss=dataset_uses_assistant_loss_mask,
             shuffle=args.shuffle,
             seed=args.seed,
             start_step=start_step,
@@ -1635,9 +1976,7 @@ def main(argv: list[str] | None = None) -> None:
     global_batch = None
     device_metrics = None
     progress_bar = None
-    progress_uses_source_examples = (
-        args.dataset_streaming and args.max_steps <= 0
-    )
+    progress_uses_source_examples = raw_streaming and args.max_steps <= 0
     progress_total_estimate = (
         plan.total_source_examples
         if progress_uses_source_examples
@@ -1727,7 +2066,7 @@ def main(argv: list[str] | None = None) -> None:
                 experiment.log(metrics, metric_step)
             except Exception as exc:
                 primary_logging_error = exc
-        if args.dataset_streaming and progress_total_estimate is not None:
+        if progress_uses_source_examples and progress_total_estimate is not None:
             source_total = progress_total_estimate
             logger.info(
                 "step=%d source_examples=%d/%d epoch=%d loss=%.6f "
@@ -1746,7 +2085,11 @@ def main(argv: list[str] | None = None) -> None:
                 "step=%d/%s source_examples=%d epoch=%d loss=%.6f "
                 "effective_weight=%.3f grad_norm=%.4f lr=%.3e",
                 metric_step,
-                plan.total_steps if args.max_steps > 0 else "?",
+                (
+                    plan.total_steps
+                    if args.max_steps > 0 or prepared_manifest is not None
+                    else "?"
+                ),
                 committed_source_examples,
                 current_epoch + 1,
                 metrics["loss"],
@@ -1947,7 +2290,7 @@ def main(argv: list[str] | None = None) -> None:
     global_batch = None
     device_metrics = None
     if (
-        args.dataset_streaming
+        raw_streaming
         and plan.total_source_examples is not None
         and args.max_steps <= 0
         and committed_source_examples != plan.total_source_examples

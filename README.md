@@ -5,6 +5,7 @@ Causal Trainer is a high-performance JAX platform for CausalLM model training on
 ## Capabilities
 
 - Segment-isolated packing for attention, shifted loss, assistant-only supervision, and EndPrompt.
+- Standalone preprocessing into process-assigned Hugging Face Parquet shards.
 - Bounded-memory Hugging Face dataset streaming with online packing.
 - A custom Efficient attention kernel that combines tiled execution, online softmax, and a custom backward path to reduce HBM traffic.
 - Projection-fused Cut cross-entropy and chunked Pallas cross-entropy for reduced activation memory.
@@ -13,24 +14,32 @@ Causal Trainer is a high-performance JAX platform for CausalLM model training on
 ## Requirements
 
 - Python 3.11 or later.
-- JAX and JAXLIB 0.10.x with a compatible `libtpu` runtime.
-- A supported checkpoint in Hugging Face tensor layout.
-- A serialized fast tokenizer containing `tokenizer.json`.
+- Offline preparation requires a serialized fast tokenizer containing `tokenizer.json`.
+- Training requires JAX and JAXLIB 0.10.x; TPU training also requires a compatible `libtpu` runtime.
+- Training requires a supported checkpoint in Hugging Face tensor layout.
 
 The trainer reads Hugging Face configuration, tokenizer, and Safetensors artifacts directly. Transformers is not a runtime dependency.
 
 ## Installation
 
-Create an isolated environment and install the TPU dependencies:
+Create an isolated environment. The base install is deliberately limited to the dataset, Hugging Face Hub, template, NumPy, and tokenizer stack needed by `causal-prepare`; it does not install JAX or checkpoint dependencies:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e '.[tpu]'
+python -m pip install -e .
 ```
 
-The package installs the `causal-train` command. The equivalent module entry point is `python -m causal_trainer.train`.
+Install either the complete CPU training stack or the complete TPU training stack separately, and combine `training` with `test` for CPU development:
+
+```bash
+python -m pip install -e '.[training]'
+python -m pip install -e '.[tpu]'
+python -m pip install -e '.[training,test]'
+```
+
+The package installs `causal-train` and the standalone `causal-prepare` data command. `causal-train` requires either the `training` or `tpu` extra. The equivalent module entry points are `python -m causal_trainer.train` and `python -m causal_trainer.prepare`.
 
 ## Quick start
 
@@ -80,7 +89,7 @@ By default, tokenizer assets are read from the model source. Use `--processor_re
 - `chat_template.jinja`
 - `chat_templates/*.jinja`
 
-Use the `HF_TOKEN` environment variable for authenticated repositories. The `--revision` option selects a specific model and tokenizer revision.
+Use the `HF_TOKEN` environment variable for authenticated repositories. `--revision` selects the model revision. When `--processor_repo_id` points to a separate tokenizer repository, pin it independently with `--processor_revision`; otherwise the tokenizer is read from the already resolved model revision.
 
 ## Dataset inputs
 
@@ -108,6 +117,73 @@ Conversational records contain a `messages` field:
 
 Message records may also provide `tools` and `chat_template_kwargs` when the selected chat template requires them.
 
+### Offline prepared datasets
+
+Use `causal-prepare` on a separate, ordinary single machine to finish tokenization, optional packing, attention/position/segment masks, assistant loss masks, loss weights, and EndPrompt before the accelerator job starts. The command uses the existing dataset and tokenizer dependencies and does not import JAX, Transformers, PyTorch, or the training runtime.
+
+Both dataset forms are supported. Use `--dataset_text_field text` (or another string-column name) for ordinary text, and use `--dataset_text_field messages` for role/content conversations rendered with the tokenizer's chat template. Assistant-only loss options are available for `messages` input.
+
+```bash
+causal-prepare \
+  --dataset_name org/raw-corpus \
+  --dataset_split train \
+  --dataset_text_field text \
+  --tokenizer_name_or_path org/model \
+  --tokenizer_revision TOKENIZER_COMMIT \
+  --output_dir ./prepared-corpus \
+  --num_shards 8 \
+  --max_sequence_length 4096 \
+  --packing True \
+  --packing_batch_size 1000 \
+  --hub_repo_id org/prepared-corpus
+```
+
+For conversational SFT data, change the input mode and optionally precompute assistant-only supervision:
+
+```bash
+causal-prepare \
+  --dataset_name org/messages-corpus \
+  --dataset_split train \
+  --dataset_text_field messages \
+  --tokenizer_name_or_path org/model \
+  --output_dir ./prepared-messages \
+  --num_shards 8 \
+  --max_sequence_length 4096 \
+  --packing True \
+  --assistant_only_loss True \
+  --hub_repo_id org/prepared-messages
+```
+
+`--num_shards` is an artifact-layout choice, not a compiled-in host or device count. The command processes source intervals sequentially on one machine and writes independent Parquet files plus a small `causal-trainer-prepared.json` manifest. EndPrompt continues to use the original global source-row index across file boundaries. The manifest records the current canonical schema, tokenizer/source identity, preprocessing settings, row counts, and file checksums; this project intentionally expects prepared artifacts to be produced by the current code rather than maintaining historical format variants. When preprocessing uses a separate tokenizer repository or revision, pass that same source to training with `--processor_repo_id` and `--processor_revision` so the prepared tokenizer digest can be verified.
+
+Train directly from the result with no online tokenizer or packer:
+
+```bash
+causal-train \
+  --repo_id org/model \
+  --dataset_name org/prepared-corpus \
+  --dataset_format prepared \
+  --dataset_split train \
+  --dataset_revision DATASET_COMMIT \
+  --max_sequence_length 4096 \
+  --total_batch_size 32 \
+  --output_dir ./output
+```
+
+For a remote prepared repository, the trainer resolves `--dataset_revision` (or the repository's default branch when it is omitted) to one immutable commit before reading either the manifest or its Parquet files.
+
+For materialized input, the trainer derives the assignment from the actual JAX process index/count and downloads only that process's contiguous interval of physical files. The files are then merged over the initialized JAX network in manifest order, so each real prepared row is cached on only one process while all processes retain the reconstructed dataset in host RAM for the existing global-batch path. A common 8-host × 4-device setup can use eight files and one JAX process per host, but neither value is hard-coded; each process controls all of its local devices normally.
+
+When even one process's assigned files or the reconstructed host arrays are too large, stream the prepared artifact instead:
+
+```text
+--dataset_format prepared \
+--dataset_streaming True \
+--dataset_revision DATASET_COMMIT
+```
+
+Prepared streaming validates and batches the already-final canonical rows directly. It never tokenizes, packs, or recomputes masks, and it keeps only bounded shuffle/window/prefetch state locally. To preserve the trainer's global-batch placement contract, every JAX process reproduces the same remote prepared stream; this mode minimizes local disk rather than network reads. Since a packed row can be large, use `--no-shuffle` for offline ordering or set a deliberately small `--streaming_shuffle_buffer` instead of retaining the default 10,000 rows.
+
 ### Streaming datasets
 
 Enable `--dataset_streaming True` to train from a Hugging Face dataset that is larger than local memory or disk. Streaming keeps only bounded working state in memory: the shuffle buffer, the active packing window, and the configured prefetched batches. It does not materialize or download the complete split before training.
@@ -119,7 +195,7 @@ Enable `--dataset_streaming True` to train from a Hugging Face dataset that is l
 --streaming_shuffle_buffer 10000
 ```
 
-`--dataset_config_name` selects an optional Hugging Face dataset configuration. `--dataset_revision` pins the dataset independently of `--revision`, which continues to select the model and tokenizer revision.
+`--dataset_config_name` selects an optional Hugging Face dataset configuration. `--dataset_revision` pins the dataset independently of the model `--revision` and the optional separate `--processor_revision`.
 
 One complete traversal of the source split is exactly one streaming epoch. Without an explicit positive `--max_steps`, `--num_train_epochs` must therefore be a positive integer. `--max_steps` may intentionally stop in the middle of an epoch.
 
@@ -187,6 +263,7 @@ Enable LoRA with:
 ```
 
 Adapters are applied to the attention and gated-MLP projections. Embeddings and the language model head remain frozen by default.
+When FSDP is greater than one, `--lora_rank` must be divisible by the FSDP mesh size because FSDP shards the adapter rank axis.
 
 To train the embedding and language model head alongside the adapters:
 

@@ -13,23 +13,32 @@ dependencies = [
   "datasets>=3.6.0",
   "huggingface-hub>=0.33.0",
   "jinja2>=3.1",
-  "jax~=0.10.2",
-  "jaxlib~=0.10.2",
-  "ml-dtypes>=0.5.0",
   "numpy>=1.26",
-  "optax>=0.2.2",
-  "safetensors>=0.5.0",
   "tokenizers~=0.22.2",
-  "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]
-tpu = ["jax[tpu]~=0.10.2"]
+training = [
+  "jax~=0.10.2",
+  "jaxlib~=0.10.2",
+  "ml-dtypes>=0.5.0",
+  "optax>=0.2.2",
+  "safetensors>=0.5.0",
+  "tqdm>=4.66",
+]
+tpu = [
+  "jax[tpu]~=0.10.2",
+  "ml-dtypes>=0.5.0",
+  "optax>=0.2.2",
+  "safetensors>=0.5.0",
+  "tqdm>=4.66",
+]
 wandb = ["wandb>=0.18.5"]
 test = ["pytest>=8.0", "ruff>=0.11"]
 
 [project.scripts]
 causal-train = "causal_trainer.train:main"
+causal-prepare = "causal_trainer.prepare:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

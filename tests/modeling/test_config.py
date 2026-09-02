@@ -39,10 +39,13 @@ def _supported_raw_config() -> dict:
 def _validation_args():
     return SimpleNamespace(
         max_sequence_length=4096,
+        dataset_format="raw",
         endprompt_enable=False,
         total_batch_size=32,
         attn_mechanism="vanilla",
         mlp_chunk_size=0,
+        lora=False,
+        lora_rank=256,
     )
 
 
@@ -131,6 +134,21 @@ def test_supported_architecture_rejects_incompatible_fsdp_partitioning() -> None
 
     with pytest.raises(ValueError, match="FSDP=3 does not divide"):
         _validate_supported_config(raw, ModelConfig.from_dict(raw), _validation_args(), _mesh(fsdp=3))
+
+
+def test_lora_rank_must_be_divisible_by_fsdp_partitioning() -> None:
+    raw = _supported_raw_config()
+    args = _validation_args()
+    args.lora_rank = 3
+
+    _validate_supported_config(raw, ModelConfig.from_dict(raw), args, _mesh(fsdp=2))
+
+    args.lora = True
+    with pytest.raises(ValueError, match="lora_rank=3 must be divisible by FSDP=2"):
+        _validate_supported_config(raw, ModelConfig.from_dict(raw), args, _mesh(fsdp=2))
+
+    args.lora_rank = 4
+    _validate_supported_config(raw, ModelConfig.from_dict(raw), args, _mesh(fsdp=2))
 
 
 def test_supported_architecture_accepts_sequence_parallel_activation_sharding() -> None:

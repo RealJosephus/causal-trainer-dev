@@ -240,8 +240,13 @@ def iter_retrying_records(
     delivered_digest = hashlib.sha256()
     pending_error: Exception | None = None
     while True:
+        delivered_snapshot = delivered
+        prefix_digest_snapshot = delivered_digest.digest()
 
-        def reopen() -> tuple[Iterator[SourceRecord], SourceRecord | object]:
+        def reopen(
+            delivered_at_open: int = delivered_snapshot,
+            expected_prefix_digest: bytes = prefix_digest_snapshot,
+        ) -> tuple[Iterator[SourceRecord], SourceRecord | object]:
             nonlocal pending_error
             if pending_error is not None:
                 error = pending_error
@@ -250,8 +255,8 @@ def iter_retrying_records(
             reopened = _resume_and_read_one(
                 source_factory,
                 epoch=epoch,
-                delivered=delivered,
-                expected_prefix_digest=delivered_digest.digest(),
+                delivered=delivered_at_open,
+                expected_prefix_digest=expected_prefix_digest,
                 digest_fields=resolved_digest_fields,
             )
             return reopened

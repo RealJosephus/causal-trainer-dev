@@ -139,9 +139,14 @@ def test_cli_accepts_bare_boolean_and_hyphenated_names() -> None:
 def test_save_optimizer_state_defaults_to_false() -> None:
     args = parse_args(["--repo-id", "local-model", "--dataset-name", "local-data"])
     assert args.save_optimizer_state is False
+    assert args.dataset_format == "raw"
     assert args.dataset_streaming is False
+    assert args.uses_raw_streaming is False
     assert args.dataset_config_name is None
     assert args.dataset_revision is None
+    assert args.processor_repo_id is None
+    assert args.processor_revision is None
+    assert args.effective_processor_revision is None
     assert args.streaming_shuffle_buffer == 10_000
     assert args.hf_retry_initial_delay == 1.0
     assert args.hf_retry_max_delay == 60.0
@@ -152,6 +157,50 @@ def test_save_optimizer_state_defaults_to_false() -> None:
     assert args.lora_train_embed_and_lm_head is False
     assert args.preprocessing_mode == "shard_then_merge"
     assert args.sharding_axis == "-1,1,1,4,1"
+
+
+def test_processor_revision_is_independent_for_a_separate_repository() -> None:
+    separate = parse_args(
+        [
+            "--repo-id",
+            "org/model",
+            "--revision",
+            "model-commit",
+            "--processor-repo-id",
+            "org/processor",
+            "--dataset-name",
+            "local-data",
+        ]
+    )
+    pinned = parse_args(
+        [
+            "--repo-id",
+            "org/model",
+            "--revision",
+            "model-commit",
+            "--processor-repo-id",
+            "org/processor",
+            "--processor-revision",
+            "processor-commit",
+            "--dataset-name",
+            "local-data",
+        ]
+    )
+    reused_model = parse_args(
+        [
+            "--repo-id",
+            "org/model",
+            "--revision",
+            "model-commit",
+            "--dataset-name",
+            "local-data",
+        ]
+    )
+
+    assert separate.processor_revision is None
+    assert separate.effective_processor_revision is None
+    assert pinned.effective_processor_revision == "processor-commit"
+    assert reused_model.effective_processor_revision == "model-commit"
 
 
 def test_cli_accepts_streaming_dataset_options() -> None:
@@ -180,12 +229,48 @@ def test_cli_accepts_streaming_dataset_options() -> None:
     )
 
     assert args.dataset_streaming is True
+    assert args.dataset_format == "raw"
+    assert args.uses_raw_streaming is True
     assert args.dataset_config_name == "clean"
     assert args.dataset_revision == "dataset-commit"
     assert args.streaming_shuffle_buffer == 2048
     assert args.hf_retry_initial_delay == 0.5
     assert args.hf_retry_max_delay == 30.0
     assert args.preprocessing_mode == "replicated"
+
+
+def test_prepared_streaming_is_not_raw_streaming() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "org/prepared-dataset",
+            "--dataset-format",
+            "prepared",
+            "--dataset-streaming",
+            "--num-train-epochs",
+            "2",
+        ]
+    )
+
+    assert args.dataset_format == "prepared"
+    assert args.dataset_streaming is True
+    assert args.uses_raw_streaming is False
+
+
+def test_dataset_format_rejects_unknown_values() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "local-data",
+                "--dataset-format",
+                "auto",
+            ]
+        )
 
 
 def test_streaming_dataset_rejects_preprocessing_workers() -> None:
@@ -238,6 +323,25 @@ def test_streaming_fractional_epochs_are_allowed_with_max_steps() -> None:
     )
     assert args.num_train_epochs == 0.5
     assert args.max_steps == 7
+
+
+def test_prepared_streaming_allows_fractional_epochs_without_max_steps() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "org/prepared-dataset",
+            "--dataset-format",
+            "prepared",
+            "--dataset-streaming",
+            "--num-train-epochs",
+            "0.5",
+        ]
+    )
+
+    assert args.num_train_epochs == 0.5
+    assert args.uses_raw_streaming is False
 
 
 @pytest.mark.parametrize(

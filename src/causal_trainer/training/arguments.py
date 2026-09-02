@@ -6,7 +6,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 _FROZEN_PARAMETER_COMPONENTS = ("lm_head", "embed", "norm")
 
 
@@ -55,6 +54,7 @@ def _add_bool(parser: argparse.ArgumentParser, name: str, default: bool, help: s
 class TrainingArguments:
     repo_id: str
     dataset_name: str
+    dataset_format: str
     dataset_split: str
     dataset_text_field: str
     dataset_streaming: bool
@@ -64,6 +64,7 @@ class TrainingArguments:
     hf_retry_initial_delay: float
     hf_retry_max_delay: float
     processor_repo_id: str | None
+    processor_revision: str | None
     output_dir: Path
     revision: str | None
     token: str | None
@@ -138,6 +139,18 @@ class TrainingArguments:
         return self.assistant_only_loss or self.last_assistant_only_loss
 
     @property
+    def uses_raw_streaming(self) -> bool:
+        """Whether records still need online tokenization while streaming."""
+
+        return self.dataset_format == "raw" and self.dataset_streaming
+
+    @property
+    def effective_processor_revision(self) -> str | None:
+        """Revision used for the effective processor source."""
+
+        return self.revision if self.processor_repo_id is None else self.processor_revision
+
+    @property
     def effective_endprompt_logical_length(self) -> int:
         return (
             self.max_sequence_length
@@ -170,6 +183,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add(parser, "repo_id", required=True, help="Local checkpoint directory or Hugging Face repository ID.")
     _add(parser, "dataset_name", required=True, help="Local dataset file/directory or Hugging Face dataset ID.")
+    _add(
+        parser,
+        "dataset_format",
+        choices=("raw", "prepared"),
+        default="raw",
+        help=(
+            "Use 'raw' to tokenize/pack during training, or 'prepared' for a "
+            "causal-prepare artifact whose masks and loss weights are already final."
+        ),
+    )
     _add(parser, "dataset_split", default="train")
     _add(parser, "dataset_text_field", default="text", help="Use 'messages' for conversational records.")
     _add_bool(
@@ -212,6 +235,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum delay in seconds between retries for transient Hugging Face read failures.",
     )
     _add(parser, "processor_repo_id", default=None)
+    _add(
+        parser,
+        "processor_revision",
+        default=None,
+        help=(
+            "Revision for a separately provided processor repository. When no "
+            "processor_repo_id is set, the already resolved model source is reused."
+        ),
+    )
     _add(parser, "output_dir", type=Path, default=Path("causal-trainer-output"))
     _add(parser, "revision", default=None)
     _add(parser, "token", default=None, help="HF token; prefer the HF_TOKEN environment variable.")
@@ -525,7 +557,7 @@ def parse_args(argv: list[str] | None = None) -> TrainingArguments:
     if args.num_train_epochs <= 0 and args.max_steps <= 0:
         raise ValueError("num_train_epochs must be positive unless max_steps is set")
     if (
-        args.dataset_streaming
+        args.uses_raw_streaming
         and args.max_steps <= 0
         and not args.num_train_epochs.is_integer()
     ):
@@ -547,7 +579,7 @@ def parse_args(argv: list[str] | None = None) -> TrainingArguments:
         raise ValueError("Hugging Face retry delays must be positive")
     if args.hf_retry_initial_delay > args.hf_retry_max_delay:
         raise ValueError("hf_retry_initial_delay cannot exceed hf_retry_max_delay")
-    if args.dataset_streaming and args.preprocessing_num_workers is not None:
+    if args.uses_raw_streaming and args.preprocessing_num_workers is not None:
         raise ValueError(
             "preprocessing_num_workers is not supported with dataset_streaming"
         )
@@ -575,7 +607,11 @@ def parse_args(argv: list[str] | None = None) -> TrainingArguments:
         raise ValueError("learning_rate_end cannot exceed learning_rate for a decay schedule")
     if args.assistant_only_loss and args.last_assistant_only_loss:
         raise ValueError("assistant_only_loss and last_assistant_only_loss are mutually exclusive")
-    if args.uses_assistant_loss_mask and args.dataset_text_field != "messages":
+    if (
+        args.dataset_format == "raw"
+        and args.uses_assistant_loss_mask
+        and args.dataset_text_field != "messages"
+    ):
         option = (
             "last_assistant_only_loss"
             if args.last_assistant_only_loss
