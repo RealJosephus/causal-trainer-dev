@@ -193,8 +193,10 @@ def _packed_segments(sequence: int, segment_count: int) -> jax.Array:
 
 
 @pytest.mark.parametrize("segment_count", [8, 32])
+@pytest.mark.parametrize("compact_statistics", [False, True])
 def test_rank0_local_tp4_packed_efficient_attention_forward_and_vjp_match_references(
     segment_count: int,
+    compact_statistics: bool,
 ) -> None:
     batch, sequence, query_heads = 1, 512, 32
     query = _bf16_normal(100, (batch, sequence, query_heads, _HEAD_DIM))
@@ -209,7 +211,9 @@ def test_rank0_local_tp4_packed_efficient_attention_forward_and_vjp_match_refere
     allowed = make_causal_segment_mask(valid, segments)
     scale = _HEAD_DIM**-0.5
     mesh = _local_mesh(tp=4, sp=1)
-    profile = resolve_attention_profile(query.shape, key.shape, mesh.shape)
+    profile = resolve_attention_profile(
+        query.shape, key.shape, mesh.shape, compact_statistics=compact_statistics
+    )
 
     assert key.shape[2] == value.shape[2] == 1
     assert profile.block_q == 256
@@ -340,7 +344,8 @@ def test_rank0_local_tp4_packed_efficient_attention_forward_and_vjp_match_refere
     assert efficient_result[2].shape[2] == efficient_result[3].shape[2] == 1
 
 
-def test_tp2_sp2_cross_shard_segment_vjp_reduces_remote_dkv() -> None:
+@pytest.mark.parametrize("compact_statistics", [False, True])
+def test_tp2_sp2_cross_shard_segment_vjp_reduces_remote_dkv(compact_statistics: bool) -> None:
     batch, sequence, query_heads = 1, 512, 4
     query = _bf16_normal(200, (batch, sequence, query_heads, _HEAD_DIM))
     key = _bf16_normal(201, (batch, sequence, 1, _HEAD_DIM))
@@ -368,7 +373,9 @@ def test_tp2_sp2_cross_shard_segment_vjp_reduces_remote_dkv() -> None:
     allowed = make_causal_segment_mask(valid, segments)
     scale = _HEAD_DIM**-0.5
     mesh = _local_mesh(tp=2, sp=2)
-    profile = resolve_attention_profile(query.shape, key.shape, mesh.shape)
+    profile = resolve_attention_profile(
+        query.shape, key.shape, mesh.shape, compact_statistics=compact_statistics
+    )
 
     assert key.shape[2] == value.shape[2] == 1
     assert sequence // int(mesh.shape["sp"]) % profile.block_q == 0

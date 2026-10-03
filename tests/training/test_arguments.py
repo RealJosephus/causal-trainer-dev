@@ -32,6 +32,9 @@ def test_cli_accepts_reference_boolean_style() -> None:
     assert args.async_dispatch_steps == 2
     assert args.prefetch_batches == 1
     assert args.logging_steps == 10
+    assert args.projection_chunk_size == 0
+    assert args.remat_group_size == 1
+    assert args.cut_chunk_size == 0
 
 
 def test_cli_does_not_expose_remote_tokenizer_code_execution() -> None:
@@ -46,6 +49,68 @@ def test_cli_does_not_expose_remote_tokenizer_code_execution() -> None:
                 "True",
             ]
         )
+
+
+def test_decoder_memory_policy_is_not_a_cli_or_training_argument() -> None:
+    args = parse_args(["--repo-id", "local-model", "--dataset-name", "local-data"])
+    private_names = {
+        "long_context_training", "long_context_chunk_size", "long_context_layers_per_group",
+        "execution_policy", "token_chunk_size", "layers_per_group",
+    }
+    assert private_names.isdisjoint(args.__dataclass_fields__)
+    assert private_names.isdisjoint(action.dest for action in build_parser()._actions)
+    assert args.scan_layers is False
+    assert args.mlp_chunk_size == 1024
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["--long-context-training", "--long-context-chunk-size", "--long-context-layers-per-group"],
+)
+def test_removed_decoder_memory_flags_are_rejected(option: str) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--repo-id", "local-model", "--dataset-name", "local-data", option, "1"])
+
+
+@pytest.mark.parametrize(
+    "options, expected",
+    [
+        (["--projection-chunk-size", "3", "--total-batch-size", "1", "--loss-implementation", "xla",
+          "--gradient-checkpointing", "disabled", "--scan-layers", "False"], (3, 1, 0, False, "xla", "disabled")),
+        (["--remat-group-size", "2", "--scan-layers", "True", "--dtype", "float32",
+          "--param-dtype", "float32"], (0, 2, 0, True, "auto", "nothing_saveable")),
+        (["--cut-chunk-size", "5", "--scan-layers", "False", "--gradient-checkpointing", "disabled",
+          "--dtype", "float32", "--param-dtype", "float32"],
+         (0, 1, 5, False, "auto", "disabled")),
+    ],
+)
+def test_memory_controls_are_independent_and_do_not_rewrite_existing_options(options, expected):
+    args = parse_args(["--repo-id", "local-model", "--dataset-name", "local-data", *options])
+    assert (
+        args.projection_chunk_size, args.remat_group_size, args.cut_chunk_size,
+        args.scan_layers, args.loss_implementation, args.gradient_checkpointing,
+    ) == expected
+    assert args.mlp_chunk_size == 1024
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--projection-chunk-size", "-1"], ["--remat-group-size", "0"], ["--cut-chunk-size", "-1"],
+        ["--projection-chunk-size", "3"],
+        ["--projection-chunk-size", "3", "--total-batch-size", "1", "--attn-mechanism", "vanilla"],
+        ["--projection-chunk-size", "3", "--total-batch-size", "1", "--dtype", "float32"],
+        ["--remat-group-size", "2", "--scan-layers", "False"],
+        ["--remat-group-size", "2", "--scan-layers", "True", "--gradient-checkpointing", "disabled"],
+        ["--cut-chunk-size", "3", "--loss-implementation", "pallas"],
+        ["--projection-chunk-size", "3", "--lora"],
+        ["--remat-group-size", "2", "--lora", "--scan-layers", "True"],
+        ["--cut-chunk-size", "3", "--frozen-parameters", "norm"],
+    ],
+)
+def test_incompatible_memory_controls_fail_instead_of_changing_other_settings(options):
+    with pytest.raises(ValueError):
+        parse_args(["--repo-id", "local-model", "--dataset-name", "local-data", *options])
 
 
 @pytest.mark.parametrize(

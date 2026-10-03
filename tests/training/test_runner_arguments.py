@@ -8,12 +8,14 @@ from causal_trainer.training.runner import (
     _PROCESSOR_ALLOW_PATTERNS,
     _buffered_streaming_schedule_total,
     _distributed_arguments_digest,
+    _explicit_memory_options,
     _prepared_streaming_limits,
     _prepared_tokenizer_digest,
     _project_streaming_progress_total,
     _resolve_processor_source,
     _resume_signature_payload,
     _streaming_schedule_position,
+    _validate_memory_options,
 )
 
 
@@ -26,6 +28,44 @@ class _Config:
     @staticmethod
     def to_dict() -> dict[str, int]:
         return {"num_hidden_layers": 40}
+
+
+def test_only_nondefault_memory_options_enter_resume_identity():
+    args = parse_args(["--repo-id", "local-model", "--dataset-name", "local-data"])
+
+    def payload(arguments):
+        return _resume_signature_payload(
+            arguments, _Config(), _Plan(), SimpleNamespace(_fingerprint="synthetic"),
+            SimpleNamespace(shape={"dp": 1, "fsdp": 1, "ep": 1, "tp": 1, "sp": 1}),
+            preprocessing_process_count=1, prepared_real_rows=1, prepared_dummy_rows=0,
+        )
+
+    assert _explicit_memory_options(SimpleNamespace()) == {}
+    assert _explicit_memory_options(args) == {}
+    baseline = payload(args)
+    for name, value in (("projection_chunk_size", 3), ("remat_group_size", 2), ("cut_chunk_size", 5)):
+        assert name not in baseline["arguments"]
+        selected = replace(args, **{name: value})
+        assert _explicit_memory_options(selected) == {name: value}
+        actual = payload(selected)
+        assert actual["arguments"].pop(name) == value
+        assert actual == baseline
+
+
+def test_memory_options_check_only_their_independent_runtime_requirements():
+    args = parse_args(["--repo-id", "local-model", "--dataset-name", "local-data"])
+    config = SimpleNamespace(num_hidden_layers=4, attention_dropout=0.0)
+    mesh = SimpleNamespace(shape={"dp": 1, "fsdp": 1, "ep": 1, "tp": 1, "sp": 1})
+    _validate_memory_options(args, object(), object())  # Defaults do not inspect new model fields.
+    _validate_memory_options(replace(args, projection_chunk_size=3, total_batch_size=1), config, mesh)
+    _validate_memory_options(replace(args, remat_group_size=2, scan_layers=True), config, mesh)
+    _validate_memory_options(replace(args, cut_chunk_size=3), config,
+                             SimpleNamespace(shape={**mesh.shape, "dp": 2}))
+    with pytest.raises(ValueError, match="divide"):
+        _validate_memory_options(replace(args, remat_group_size=3, scan_layers=True), config, mesh)
+    with pytest.raises(ValueError, match="dp=fsdp=ep"):
+        _validate_memory_options(replace(args, projection_chunk_size=3, total_batch_size=1), config,
+                                 SimpleNamespace(shape={**mesh.shape, "dp": 2}))
 
 
 def test_separate_processor_resolution_does_not_download_model_weights(

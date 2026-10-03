@@ -107,6 +107,42 @@ def _prepared_tokenizer_digest(
     return digest.hexdigest()
 
 
+def _explicit_memory_options(args: TrainingArguments) -> dict[str, int]:
+    return {
+        name: getattr(args, name, default)
+        for name, default in (("projection_chunk_size", 0), ("remat_group_size", 1), ("cut_chunk_size", 0))
+        if getattr(args, name, default) != default
+    }
+
+
+def _validate_memory_options(args: TrainingArguments, config, mesh) -> None:
+    options = _explicit_memory_options(args)
+    if not options:
+        return
+    if args.lora or getattr(args, "frozen_parameters", None):
+        raise ValueError("explicit memory options require full-parameter training")
+    if options.get("projection_chunk_size", 0):
+        if args.dtype != "bfloat16" or args.param_dtype != "bfloat16":
+            raise ValueError("projection_chunk_size requires BF16 compute and parameters")
+    if options.get("projection_chunk_size", 0):
+        if any(int(mesh.shape[axis]) != 1 for axis in ("dp", "fsdp", "ep")):
+            raise ValueError("projection_chunk_size requires dp=fsdp=ep=1")
+        if args.attn_mechanism != "efficient" or args.total_batch_size != 1 or config.attention_dropout != 0.0:
+            raise ValueError(
+                "projection_chunk_size requires efficient attention, batch size 1 and zero attention dropout"
+            )
+    if options.get("remat_group_size", 1) > 1:
+        if not args.scan_layers or args.gradient_checkpointing != "nothing_saveable":
+            raise ValueError("remat_group_size>1 requires scan_layers=True and nothing_saveable rematerialization")
+        if config.num_hidden_layers % options["remat_group_size"]:
+            raise ValueError("remat_group_size must divide num_hidden_layers")
+    if options.get("cut_chunk_size", 0):
+        if any(int(mesh.shape[axis]) != 1 for axis in ("fsdp", "ep")):
+            raise ValueError("cut_chunk_size requires fsdp=ep=1")
+        if args.loss_implementation not in {"auto", "cut"}:
+            raise ValueError("cut_chunk_size requires the Cut loss backend")
+
+
 def _validate_supported_config(
     raw_config: dict[str, Any],
     config,
@@ -187,6 +223,8 @@ def _validate_supported_config(
     ):
         raise ValueError("EndPrompt logical length exceeds the checkpoint's max_position_embeddings")
 
+    _validate_memory_options(args, config, mesh)
+
     if mesh.shape["ep"] != 1:
         raise ValueError("this fixed architecture requires ep=1")
     tensor_parallel = mesh.shape["tp"]
@@ -225,7 +263,7 @@ def _validate_supported_config(
             f"max_sequence_length={args.max_sequence_length} must be divisible by "
             f"SP={sequence_parallel}"
         )
-    if sequence_parallel > 1 and args.mlp_chunk_size > 0:
+    if sequence_parallel > 1 and args.mlp_chunk_size > 0 and not getattr(args, "projection_chunk_size", 0):
         raise ValueError(
             "mlp_chunk_size must be 0 when SP>1: the current global-sequence "
             "scan would all-gather and redundantly recompute MLP tiles"
@@ -292,8 +330,12 @@ def _resolve_loss_implementation(
     if backend != "tpu":
         raise ValueError("this trainer requires a TPU JAX backend")
     if args.loss_implementation == "auto":
-        return "cut" if cut_mesh_supported else "pallas"
-    return args.loss_implementation
+        implementation = "cut" if cut_mesh_supported else "pallas"
+    else:
+        implementation = args.loss_implementation
+    if getattr(args, "cut_chunk_size", 0) > 0 and (implementation != "cut" or not cut_mesh_supported):
+        raise ValueError("cut_chunk_size requires the Cut loss backend and a supported mesh")
+    return implementation
 
 
 _STREAMING_SCHEDULE_METADATA_PERCENT = 105
@@ -496,6 +538,7 @@ def _resume_signature_payload(
         "sharding_dcn_axis",
     )
     arguments = {name: getattr(args, name) for name in argument_names}
+    arguments.update(_explicit_memory_options(args))
     payload = {
         "arguments": arguments,
         "dataset_fingerprint": getattr(dataset, "_fingerprint", None),
@@ -1638,6 +1681,7 @@ def main(argv: list[str] | None = None) -> None:
             "replicated_named_sharding": scalar_sharding,
             "external_learning_rate": source_progress_schedule,
         }
+        common_step_options.update(_explicit_memory_options(args))
         if args.lora:
             train_step = make_lora_train_step(
                 config,

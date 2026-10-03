@@ -332,9 +332,14 @@ Available values are:
 ### Execution controls
 
 - `--mlp_chunk_size` controls static sequence tiling for the gated MLP. Use `0` to disable tiling. When omitted, the trainer selects a value from the training mode, context length, and sequence-parallel configuration.
+- `--projection_chunk_size` controls shard-local token tiling for attention projections and normalization. The default `0` keeps the original projection path. With a positive value, hidden states remain feature-sharded between layers, and `--mlp_chunk_size` independently controls shard-local MLP tile sizes. MLP tiling with `sp>1` requires this projection path.
+- `--remat_group_size` controls the number of decoder layers in each recomputation group. The default `1` keeps the original layer checkpointing. Larger values require `--scan_layers True`, `--gradient_checkpointing nothing_saveable`, and must divide the layer count.
+- `--cut_chunk_size` controls shard-local token chunks for Cut loss, independently of decoder tiling. The default `0` keeps the original Cut execution; positive values require the Cut backend.
 - `--scan_layers` represents the decoder layer loop with `lax.scan`. `--no-scan-layers` selects the unrolled form. When neither is provided, the trainer applies its context-aware default.
 - `--async_dispatch_steps` controls deferred host synchronization for completed step metrics.
 - `--prefetch_batches` controls prepared global batches retained ahead of the active training step.
+
+Projection tiling currently supports full-parameter BF16 training with Efficient attention, zero attention dropout, a single-example microbatch, and `dp=fsdp=ep=1`. It also uses compact attention statistics. These controls change storage and recomputation while preserving packed-segment boundaries, position IDs, padding, and loss weights. The new controls retain the original execution at their defaults; incompatible explicit settings raise an error. Non-default values are included in checkpoint compatibility checks, as with the existing execution controls.
 
 ## Distributed training
 

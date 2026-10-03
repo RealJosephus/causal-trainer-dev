@@ -129,6 +129,9 @@ class TrainingArguments:
     logging_steps: int
     track_memory: bool
     weight_distribution_log_steps: int
+    projection_chunk_size: int = 0
+    remat_group_size: int = 1
+    cut_chunk_size: int = 0
 
     @property
     def effective_batch_size(self) -> int:
@@ -374,7 +377,8 @@ def build_parser() -> argparse.ArgumentParser:
             "uses 1024 only for contexts from 4096 through 131071 tokens and disables tiling "
             "outside that range; LoRA and sequence-parallel training disable it automatically. "
             "Each device processes local_batch_size * mlp_chunk_size token rows per tile; "
-            "explicit 0 disables tiling."
+            "explicit 0 disables tiling. A positive projection_chunk_size permits explicit "
+            "MLP tiles within each SP shard."
         ),
     )
     _add(
@@ -396,6 +400,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         default=None,
     )
+    _add(parser, "projection_chunk_size", type=int, default=0,
+         help="SP-local token rows per projection tile; 0 preserves ordinary projections.")
+    _add(parser, "remat_group_size", type=int, default=1,
+         help="Layers per rematerialized scan group; 1 preserves the ordinary layer loop.")
+    _add(parser, "cut_chunk_size", type=int, default=0,
+         help="Local token rows per Cut loss chunk; 0 preserves ordinary Cut execution.")
     _add(
         parser,
         "async_dispatch_steps",
@@ -519,10 +529,9 @@ def parse_args(argv: list[str] | None = None) -> TrainingArguments:
     if namespace.block_size_k is None:
         namespace.block_size_k = automatic_attention_block_size
     if namespace.mlp_chunk_size is None:
-        # The current tiled MLP scans global sequence chunks. Under SP that
-        # causes GSPMD to all-gather the chunk list and redundantly evaluate
-        # the complete sequence on every SP rank. Keep the token-local untiled
-        # projection until a shard-local Pallas/scan implementation exists.
+        # Preserve the existing defaults, including untiled MLP execution
+        # under SP. Explicit projection_chunk_size enables shard-local MLP
+        # tiles when mlp_chunk_size is supplied; it does not change this default.
         try:
             requested_sp = int(namespace.sharding_axis.split(",")[-1].strip())
         except (AttributeError, ValueError):
@@ -552,6 +561,23 @@ def parse_args(argv: list[str] | None = None) -> TrainingArguments:
             parse_frozen_parameter_components(namespace.frozen_parameters)
         )
     args = TrainingArguments(**vars(namespace))
+    if args.projection_chunk_size < 0 or args.cut_chunk_size < 0 or args.remat_group_size < 1:
+        raise ValueError(
+            "projection_chunk_size and cut_chunk_size must be nonnegative; remat_group_size must be positive"
+        )
+    explicit_memory = args.projection_chunk_size > 0 or args.cut_chunk_size > 0 or args.remat_group_size > 1
+    if explicit_memory and (args.lora or args.frozen_parameters):
+        raise ValueError("projection_chunk_size, remat_group_size and cut_chunk_size require full-parameter training")
+    if args.projection_chunk_size > 0:
+        if args.dtype != "bfloat16" or args.param_dtype != "bfloat16":
+            raise ValueError("projection_chunk_size requires BF16 compute and parameters")
+    if args.projection_chunk_size > 0:
+        if args.attn_mechanism != "efficient" or args.total_batch_size != 1:
+            raise ValueError("projection_chunk_size requires efficient attention and total_batch_size=1")
+    if args.remat_group_size > 1 and (not args.scan_layers or args.gradient_checkpointing != "nothing_saveable"):
+        raise ValueError("remat_group_size>1 requires scan_layers=True and gradient_checkpointing=nothing_saveable")
+    if args.cut_chunk_size > 0 and args.loss_implementation not in {"auto", "cut"}:
+        raise ValueError("cut_chunk_size requires the Cut loss backend")
     if args.max_sequence_length <= 1:
         raise ValueError("max_sequence_length must be greater than one")
     if args.num_train_epochs <= 0 and args.max_steps <= 0:

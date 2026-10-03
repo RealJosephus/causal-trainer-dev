@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import functools
+import importlib
 import inspect
 from collections.abc import Mapping
 from pathlib import Path
@@ -23,7 +25,14 @@ from causal_trainer.kernels.efficient_attention import (
     validate_attention_profile,
 )
 from causal_trainer.modeling.architecture import decoder_forward, forward
-from causal_trainer.modeling.attention import _attention_precanonicalized, attention
+from causal_trainer.modeling.attention import (
+    _attention_precanonicalized,
+    attention,
+    make_causal_segment_mask,
+    vanilla_attention,
+)
+
+efficient_module = importlib.import_module("causal_trainer.kernels.efficient_attention")
 
 
 def _mesh_shape(*, dp: int = 1, fsdp: int = 1, tp: int = 1, sp: int = 1) -> dict[str, int]:
@@ -43,6 +52,168 @@ def test_efficient_is_the_model_api_default() -> None:
         forward,
     ):
         assert inspect.signature(function).parameters["implementation"].default == "efficient"
+
+
+def test_compact_statistics_is_explicitly_opt_in() -> None:
+    q_shape, kv_shape = (1, 8192, 4, 128), (1, 8192, 1, 128)
+    mesh = _mesh_shape(tp=2, sp=2)
+    ordinary = resolve_attention_profile(q_shape, kv_shape, mesh)
+    compact = resolve_attention_profile(q_shape, kv_shape, mesh, compact_statistics=True)
+
+    assert ordinary.compact_statistics is False
+    assert compact.compact_statistics is True
+    assert (compact.block_h, compact.block_q, compact.block_kv_outer, compact.block_kv_compute) == (
+        ordinary.block_h, ordinary.block_q, ordinary.block_kv_outer, ordinary.block_kv_compute
+    )
+    with pytest.raises(TypeError, match="compact_statistics must be a static bool"):
+        resolve_attention_profile(q_shape, kv_shape, mesh, compact_statistics=1)
+
+
+@pytest.mark.parametrize("heads", [1, 2, 8])
+def test_compact_statistics_preserves_token_head_order_when_loading_tiles(heads: int) -> None:
+    stats = jnp.arange(2 * 512 * heads, dtype=jnp.float32).reshape(2, 512, heads)
+    compact = efficient_module._statistics_kernel_input(stats, compact=True)
+    expanded = efficient_module._statistics_kernel_input(stats, compact=False)
+    start, stop = 128 * heads, 256 * heads
+
+    assert compact.shape == (2 * 512 * heads,)
+    assert compact.size * 128 == expanded.size
+    compact_tile = efficient_module._load_row_stat(compact[512 * heads + start:512 * heads + stop], 128 * heads)
+    ordinary_tile = efficient_module._load_row_stat(expanded[1:2, 128:256], 128 * heads)
+    np.testing.assert_array_equal(compact_tile, ordinary_tile)
+    np.testing.assert_array_equal(jnp.max(compact_tile, axis=-1), compact[512 * heads + start:512 * heads + stop])
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("sequence", [4096, 8192])
+def test_statistics_hbm_shapes_in_forward_and_both_backward_kernels(
+    monkeypatch: pytest.MonkeyPatch,
+    compact: bool,
+    sequence: int,
+) -> None:
+    """Trace real wrappers at training shapes without allocating their buffers.
+
+    Intercept only the hardware call: this catches accidental full-sequence
+    lane expansion on any of the three Pallas boundaries on CPU CI as well.
+    """
+
+    calls = []
+
+    def capture_pallas_call(_kernel, **kwargs):
+        def call(*args):
+            calls.append((kwargs, tuple(value.shape for value in args)))
+            return jax.tree.map(lambda shape: jnp.zeros(shape.shape, shape.dtype), kwargs["out_shape"])
+
+        return call
+
+    monkeypatch.setattr(efficient_module.pl, "pallas_call", capture_pallas_call)
+    monkeypatch.setattr(
+        efficient_module,
+        "_output_shape",
+        lambda shape, dtype, _like: jax.ShapeDtypeStruct(shape, dtype),
+    )
+    q_shape, kv_shape = (1, sequence, 4, 128), (1, sequence, 1, 128)
+    profile = resolve_attention_profile(
+        q_shape, kv_shape, _mesh_shape(tp=2, sp=2), compact_statistics=compact
+    )
+    local_shape = (1, sequence // 2, 2, 128)
+
+    def trace(q, k, v):
+        q_segments = jnp.ones(q.shape[:2], jnp.int32)
+        kv_segments = jnp.ones(k.shape[:2], jnp.int32)
+        q_summary = jnp.ones((1, q.shape[1] // profile.block_q, 2), jnp.int32)
+        kv_summary = jnp.ones((1, sequence // profile.block_kv_outer, 2), jnp.int32)
+        common = (q, k, v, q_segments, kv_segments, q_summary, kv_summary)
+        offsets = jnp.asarray([sequence // 2, 0], jnp.int32)
+        options = {"profile": profile, "scale": 128**-0.5, "causal": True}
+        output, lse = efficient_module._local_attention_forward(*common, offsets, **options)
+        delta = jnp.zeros(q.shape[:3], jnp.float32)
+        backward = (*common, lse, output, delta, offsets)
+        dq = efficient_module._local_attention_dq(*backward, **options)
+        dk, dv = efficient_module._local_attention_dkv(*backward, **options)
+        return output, lse, dq, dk, dv
+
+    shapes = jax.eval_shape(
+        trace,
+        jax.ShapeDtypeStruct(local_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(kv_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(kv_shape, jnp.bfloat16),
+    )
+    assert [shape.shape for shape in shapes] == [local_shape, local_shape[:3], local_shape, kv_shape, kv_shape]
+    assert len(calls) == 3
+    expected = (sequence,) if compact else (*local_shape[:3], 128)
+    assert calls[0][0]["out_shape"][1].shape == expected
+    for options, input_shapes in calls[1:]:
+        assert input_shapes[8] == input_shapes[10] == expected
+        spec = options["grid_spec"].in_specs[5]
+        expected_block = (profile.block_q * profile.block_h,) if compact else (
+            1, profile.block_q, profile.block_h, 128
+        )
+        assert spec.block_shape == expected_block
+
+
+@pytest.mark.parametrize(("tp", "sp", "batch"), [(1, 1, 2), (2, 2, 1)])
+def test_compact_pallas_interpreter_packed_forward_and_vjp(
+    monkeypatch: pytest.MonkeyPatch,
+    tp: int,
+    sp: int,
+    batch: int,
+) -> None:
+    """Exercise actual tile arithmetic; TPU lowering has a separate hardware gate."""
+
+    if jax.device_count() < tp * sp:
+        pytest.skip("set XLA_FLAGS=--xla_force_host_platform_device_count=4 for the TP/SP interpreter gate")
+    monkeypatch.setattr(
+        efficient_module.pl, "pallas_call", functools.partial(efficient_module.pl.pallas_call, interpret=True)
+    )
+    # JAX 0.10's HLO interpreter discharges scalar-prefetch refs using invariant
+    # slice indices, which fails VMA checking on varying SP summaries. Hardware
+    # gates below keep the production check_vma=True path unchanged.
+    monkeypatch.setattr(
+        efficient_module,
+        "shard_map",
+        lambda fn, **kwargs: jax.shard_map(fn, **(kwargs | {"check_vma": False})),
+    )
+    devices = np.asarray(jax.devices()[:tp * sp], dtype=object).reshape(1, 1, 1, tp, sp)
+    mesh = Mesh(devices, ("dp", "fsdp", "ep", "tp", "sp"))
+    sequence, heads = 256, 2 * tp
+    rng = np.random.default_rng(931)
+    query = jnp.asarray(rng.normal(scale=0.05, size=(batch, sequence, heads, 128)), jnp.bfloat16)
+    key = jnp.asarray(rng.normal(scale=0.05, size=(batch, sequence, 1, 128)), jnp.bfloat16)
+    value = jnp.asarray(rng.normal(scale=0.05, size=key.shape), jnp.bfloat16)
+    positions = jnp.broadcast_to(jnp.arange(sequence)[None, :], (batch, sequence))
+    segments = jnp.where(positions < 17, 0, jnp.where(positions < 71, 1, jnp.where(positions < 211, 2, 3)))
+    cotangent = jnp.asarray(rng.normal(scale=0.02, size=query.shape), jnp.bfloat16)
+    # Only the right side of a record spanning the SP boundary receives dO.
+    cotangent = jnp.where(((positions >= 160) & (positions < 211))[:, :, None, None], cotangent, 0)
+    scale = 128**-0.5
+
+    def value_and_vjp(fn):
+        output, backward = jax.vjp(fn, query, key, value)
+        return (output, *backward(cotangent))
+
+    allowed = make_causal_segment_mask(segments != 0, segments)
+    reference = value_and_vjp(lambda q, k, v: vanilla_attention(q, k, v, allowed, scale=scale))
+    results = []
+    with jax.set_mesh(mesh):
+        for compact in (False, True):
+            profile = AttentionKernelProfile(2, 128, 128, 128, compact_statistics=compact)
+            metadata = prepare_attention_metadata(segments, mesh=mesh, profile=profile)
+            results.append(value_and_vjp(functools.partial(
+                efficient_module._efficient_attention_impl,
+                metadata=metadata, mesh=mesh, profile=profile, scale=scale, causal=True,
+            )))
+
+    for compact_result, ordinary_result, expected in zip(results[1], results[0], reference, strict=True):
+        actual = np.asarray(compact_result, dtype=np.float32)
+        expected = np.asarray(expected, dtype=np.float32)
+        np.testing.assert_array_equal(actual, np.asarray(ordinary_result, dtype=np.float32))
+        relative_l2 = np.linalg.norm(actual - expected) / max(np.linalg.norm(expected), 1e-12)
+        assert relative_l2 < 0.03
+        assert not np.any(actual[np.asarray(segments == 0)])
+    for gradient in results[1][2:]:
+        assert np.any(np.asarray(gradient, dtype=np.float32)[0, 71:128] != 0)
+        assert not np.any(np.asarray(gradient, dtype=np.float32)[np.asarray(segments != 2)])
 
 
 @pytest.mark.parametrize(

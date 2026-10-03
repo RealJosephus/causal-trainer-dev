@@ -54,6 +54,7 @@ class AttentionKernelProfile:
     block_q: int
     block_kv_outer: int
     block_kv_compute: int
+    compact_statistics: bool = False
 
 
 class AttentionMetadata(NamedTuple):
@@ -157,6 +158,8 @@ def validate_attention_profile(
 
     if not isinstance(profile, AttentionKernelProfile):
         raise TypeError(f"profile must be AttentionKernelProfile, got {type(profile).__name__}")
+    if not isinstance(profile.compact_statistics, bool):
+        raise TypeError("profile.compact_statistics must be a static bool")
     query_shape, _, tp_size, sp_size = _validate_qkv_shapes(q_shape, kv_shape, mesh_shape)
     block_h = _static_positive_int(profile.block_h, "block_h")
     block_q = _static_positive_int(profile.block_q, "block_q")
@@ -221,6 +224,8 @@ def resolve_attention_profile(
     q_shape: Sequence[int],
     kv_shape: Sequence[int],
     mesh_shape: Mapping[str, int] | Mesh,
+    *,
+    compact_statistics: bool = False,
 ) -> AttentionKernelProfile:
     """Resolve a static kernel profile from global shapes and named mesh sizes."""
 
@@ -245,6 +250,7 @@ def resolve_attention_profile(
         block_q=block_q,
         block_kv_outer=block_kv_outer,
         block_kv_compute=block_kv_compute,
+        compact_statistics=compact_statistics,
     )
     validate_attention_profile(profile, q_shape, kv_shape, mesh_shape)
     return profile
@@ -421,6 +427,25 @@ def _broadcast_row_stat(stat: Array, width: int) -> Array:
     if remainder:
         raise ValueError(f"row-stat width must be <=128 or a multiple of 128, got {width}")
     return jnp.tile(stat, (1, repeats))
+
+
+def _load_row_stat(stat_ref, rows: int) -> Array:
+    """Expand compact HBM statistics only after loading the current VMEM tile.
+
+    Flattening batch, sequence, and heads makes the HBM window 128-aligned,
+    including TP layouts with only one or two local query heads. Keeping the
+    head count as the final HBM dimension would reintroduce TPU layout padding.
+    """
+
+    if len(stat_ref.shape) == 1:
+        return lax.broadcast_in_dim(stat_ref[:], (rows, _NUM_LANES), (0,))
+    return stat_ref[0, :, :, :].reshape((rows, _NUM_LANES))
+
+
+def _statistics_kernel_input(stat: Array, *, compact: bool) -> Array:
+    if compact:
+        return stat.reshape((-1,))
+    return lax.broadcast_in_dim(stat, (*stat.shape, _NUM_LANES), (0, 1, 2))
 
 
 def _async_kv_copies(
@@ -657,7 +682,12 @@ def _attention_forward_kernel(
         output_ref[0, :, :, :] = normalized.reshape(
             (block_q, block_h, head_dim)
         ).astype(output_ref.dtype)
-        lse_ref[0, :, :, :] = lse.reshape((block_q, block_h, _NUM_LANES))
+        if len(lse_ref.shape) == 1:
+            # All lanes contain the same row statistic. The reduction moves
+            # it into a one-dimensional, densely stored TPU vector layout.
+            lse_ref[:] = jnp.max(lse, axis=-1)
+        else:
+            lse_ref[0, :, :, :] = lse.reshape((block_q, block_h, _NUM_LANES))
 
 
 def _forward_index_specs(
@@ -715,10 +745,20 @@ def _forward_index_specs(
         (1, _NUM_SUBLANES, profile.block_kv_outer),
         kv_segment_index_map,
     )
-    lse_spec = pl.BlockSpec(
-        (1, profile.block_q, profile.block_h, _NUM_LANES),
-        q_index_map,
-    )
+    if profile.compact_statistics:
+        # block_h covers all local heads, hence one packed tile per Q block.
+        # A flat array also avoids an 8-sublane alignment restriction on batch.
+        lse_spec = pl.BlockSpec(
+            (profile.block_q * profile.block_h,),
+            lambda batch_index, q_block_index, _head_block_index, _kv_block_index, *_: (
+                batch_index * q_blocks + q_block_index,
+            ),
+        )
+    else:
+        lse_spec = pl.BlockSpec(
+            (1, profile.block_q, profile.block_h, _NUM_LANES),
+            q_index_map,
+        )
     grid = (
         batch,
         q_blocks,
@@ -767,7 +807,9 @@ def _local_attention_forward(
     )
     output_shape = _output_shape(local_q.shape, local_q.dtype, local_q)
     lse_lane_shape = _output_shape(
-        (batch, query_length, local_heads, _NUM_LANES),
+        (batch * query_length * local_heads,)
+        if profile.compact_statistics
+        else (batch, query_length, local_heads, _NUM_LANES),
         jnp.float32,
         local_q,
     )
@@ -818,6 +860,8 @@ def _local_attention_forward(
         q_segment_lanes,
         kv_segment_lanes,
     )
+    if profile.compact_statistics:
+        return output, lse_lanes.reshape((batch, query_length, local_heads))
     # Compact the lane-expanded value at the kernel boundary to bound its lifetime.
     return output, lse_lanes[..., 0]
 
@@ -848,8 +892,8 @@ def _dq_compute_tile(
     head_dim = q_ref.shape[-1]
     query = q_ref[0, :, :, :].reshape((rows, head_dim))
     output_cotangent = do_ref[0, :, :, :].reshape((rows, head_dim)).astype(jnp.float32)
-    logsumexp = lse_ref[0, :, :, :].reshape((rows, _NUM_LANES))
-    delta = delta_ref[0, :, :, :].reshape((rows, _NUM_LANES))
+    logsumexp = _load_row_stat(lse_ref, rows)
+    delta = _load_row_stat(delta_ref, rows)
     key = k_buffer_ref[slot, :, :]
     value = v_buffer_ref[slot, :, :]
     scores = lax.dot_general(
@@ -1042,16 +1086,8 @@ def _local_attention_dq(
         (batch, _NUM_SUBLANES, sequence),
         (0, 2),
     )
-    lse_lanes = lax.broadcast_in_dim(
-        lse,
-        (*lse.shape, _NUM_LANES),
-        (0, 1, 2),
-    )
-    delta_lanes = lax.broadcast_in_dim(
-        delta,
-        (*delta.shape, _NUM_LANES),
-        (0, 1, 2),
-    )
+    lse_lanes = _statistics_kernel_input(lse, compact=profile.compact_statistics)
+    delta_lanes = _statistics_kernel_input(delta, compact=profile.compact_statistics)
     grid, q_spec, q_segment_spec, kv_segment_spec, stat_spec = _forward_index_specs(
         local_q,
         local_k,
@@ -1139,8 +1175,8 @@ def _dkv_compute_tile(
     query_bf16 = q_ref[0, :, :, :].reshape((rows, head_dim))
     query = query_bf16.astype(jnp.float32)
     output_cotangent = do_ref[0, :, :, :].reshape((rows, head_dim)).astype(jnp.float32)
-    logsumexp = lse_ref[0, :, :, :].reshape((rows, _NUM_LANES))
-    delta = delta_ref[0, :, :, :].reshape((rows, _NUM_LANES))
+    logsumexp = _load_row_stat(lse_ref, rows)
+    delta = _load_row_stat(delta_ref, rows)
     compute_slice = pl.ds(compute_offset, block_kv_compute)
     key = k_ref[compute_slice, :]
     value = v_ref[compute_slice, :]
@@ -1317,8 +1353,8 @@ def _local_attention_dkv(
         (batch, _NUM_SUBLANES, sequence),
         (0, 2),
     )
-    lse_lanes = lax.broadcast_in_dim(lse, (*lse.shape, _NUM_LANES), (0, 1, 2))
-    delta_lanes = lax.broadcast_in_dim(delta, (*delta.shape, _NUM_LANES), (0, 1, 2))
+    lse_lanes = _statistics_kernel_input(lse, compact=profile.compact_statistics)
+    delta_lanes = _statistics_kernel_input(delta, compact=profile.compact_statistics)
 
     def q_index_map(batch_index, _kv_block_index, q_work_index, *_):
         return batch_index, q_work_index // head_blocks, q_work_index % head_blocks, 0
@@ -1365,10 +1401,16 @@ def _local_attention_dkv(
         (1, _NUM_SUBLANES, profile.block_kv_outer),
         kv_segment_index_map,
     )
-    stat_spec = pl.BlockSpec(
-        (1, profile.block_q, profile.block_h, _NUM_LANES),
-        q_index_map,
-    )
+    if profile.compact_statistics:
+        stat_spec = pl.BlockSpec(
+            (profile.block_q * profile.block_h,),
+            lambda batch_index, _kv_block_index, q_work_index, *_: (batch_index * q_blocks + q_work_index,),
+        )
+    else:
+        stat_spec = pl.BlockSpec(
+            (1, profile.block_q, profile.block_h, _NUM_LANES),
+            q_index_map,
+        )
     dkv_spec = pl.BlockSpec(
         (profile.block_kv_outer, head_dim),
         kv_index_map,

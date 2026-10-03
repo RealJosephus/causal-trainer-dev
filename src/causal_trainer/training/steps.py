@@ -36,11 +36,49 @@ def make_train_step(
     gather_kv_projection_weights: bool = False,
     scan_layers: bool = False,
     external_learning_rate: bool = False,
+    projection_chunk_size: int = 0,
+    remat_group_size: int = 1,
+    cut_chunk_size: int = 0,
 ):
     if gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive")
+    for name, value, minimum in (
+        ("projection_chunk_size", projection_chunk_size, 0),
+        ("remat_group_size", remat_group_size, 1),
+        ("cut_chunk_size", cut_chunk_size, 0),
+    ):
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"{name} must be a static integer >= {minimum}")
+    if projection_chunk_size:
+        if jnp.dtype(compute_dtype) != jnp.dtype(jnp.bfloat16):
+            raise ValueError("projection_chunk_size requires BF16 compute and parameters")
+    if projection_chunk_size:
+        if mesh is None or any(int(mesh.shape[axis]) != 1 for axis in ("dp", "fsdp", "ep")):
+            raise ValueError("projection_chunk_size requires dp=fsdp=ep=1")
+        if attention_implementation != "efficient" or config.attention_dropout != 0.0:
+            raise ValueError("projection_chunk_size requires efficient attention and zero attention dropout")
+    if remat_group_size > 1:
+        if not scan_layers or remat_policy != "nothing_saveable":
+            raise ValueError("remat_group_size>1 requires scan_layers=True and nothing_saveable rematerialization")
+        if config.num_hidden_layers % remat_group_size:
+            raise ValueError("remat_group_size must divide num_hidden_layers")
+    if cut_chunk_size:
+        if loss_implementation != "cut":
+            raise ValueError("cut_chunk_size requires the Cut loss backend")
+        if mesh is None or any(int(mesh.shape.get(axis, 1)) != 1 for axis in ("fsdp", "ep")):
+            raise ValueError("cut_chunk_size requires fsdp=ep=1")
+    decoder_options = {}
+    if projection_chunk_size:
+        decoder_options["projection_chunk_size"] = projection_chunk_size
+    if remat_group_size > 1:
+        decoder_options["remat_group_size"] = remat_group_size
 
     def one_microbatch(params, batch):
+        if projection_chunk_size:
+            if any(value.dtype != jnp.dtype(jnp.bfloat16) for value in jax.tree.leaves(params)):
+                raise ValueError("projection_chunk_size requires BF16 parameters")
+        if projection_chunk_size and batch["input_ids"].shape[0] != 1:
+            raise ValueError("projection_chunk_size requires global microbatch size 1")
         hidden_states = decoder_forward(
             params,
             config,
@@ -58,6 +96,7 @@ def make_train_step(
             mlp_chunk_size=mlp_chunk_size,
             gather_kv_projection_weights=gather_kv_projection_weights,
             scan_layers=scan_layers,
+            **decoder_options,
         )
         return chunked_causal_lm_loss(
             hidden_states,
@@ -72,6 +111,7 @@ def make_train_step(
             mesh=mesh,
             sparse_skip=sparse_loss_skip,
             lm_head_trainable=True,
+            **({"cut_chunk_size": cut_chunk_size} if cut_chunk_size else {}),
         )
 
     def train_step(params, optimizer_state, batch, step):

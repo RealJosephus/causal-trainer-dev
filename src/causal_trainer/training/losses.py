@@ -164,6 +164,7 @@ def chunked_causal_lm_loss(
     mesh=None,
     sparse_skip: bool = False,
     lm_head_trainable: bool = True,
+    cut_chunk_size: int = 0,
 ) -> tuple[Array, Array]:
     """Compute shifted LM loss without materializing full-sequence logits.
 
@@ -208,6 +209,7 @@ def chunked_causal_lm_loss(
         mesh=mesh,
         sparse_skip=sparse_skip,
         lm_head_trainable=lm_head_trainable,
+        **({"cut_chunk_size": cut_chunk_size} if cut_chunk_size else {}),
     )
 
 

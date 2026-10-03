@@ -121,6 +121,7 @@ def fused_linear_cross_entropy(
     mesh=None,
     sparse_skip: bool = False,
     lm_head_trainable: bool = True,
+    cut_chunk_size: int = 0,
 ) -> tuple[Array, Array]:
     """Return ``(nll_sum, weight_sum)`` for the selected exact CE backend.
 
@@ -129,12 +130,18 @@ def fused_linear_cross_entropy(
     the Cut frozen-head path does not trace or execute a dHead kernel.  The
     per-device ``token_budget`` bounds XLA/Pallas logits slabs; Cut ignores it
     because its fixed VMEM tiles never materialize an HBM logits slab.
+    ``cut_chunk_size`` explicitly bounds the SP-local hidden rows gathered
+    across TP for tiled Cut execution; zero keeps ordinary Cut.
     """
 
     if token_budget <= 0:
         raise ValueError("token_budget must be positive")
     if implementation not in {"xla", "pallas", "cut"}:
         raise ValueError(f"unknown loss implementation: {implementation!r}")
+    if isinstance(cut_chunk_size, bool) or not isinstance(cut_chunk_size, int) or cut_chunk_size < 0:
+        raise ValueError("cut_chunk_size must be a non-negative static integer")
+    if cut_chunk_size and implementation != "cut":
+        raise ValueError("cut_chunk_size requires the Cut loss backend")
 
     hidden_states = jnp.asarray(hidden_states)
     lm_head_kernel = jnp.asarray(lm_head_kernel)
@@ -187,6 +194,7 @@ def fused_linear_cross_entropy(
             mesh=mesh,
             sparse_compaction=sparse_skip,
             lm_head_trainable=lm_head_trainable,
+            **({"local_chunk_size": cut_chunk_size} if cut_chunk_size else {}),
         )
 
     effective_chunk_size = _per_device_sequence_chunk_size(

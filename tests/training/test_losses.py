@@ -2,9 +2,39 @@ from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from causal_trainer.data.packing import pack_examples
 from causal_trainer.training.losses import causal_lm_loss, chunked_causal_lm_loss, shifted_loss_mask
+
+
+def test_cut_chunk_preserves_globally_shifted_packed_targets(monkeypatch):
+    import causal_trainer.training.losses as loss_module
+
+    class MeshShape:
+        def __init__(self):
+            self.shape = {"sp": 2}
+
+    ids = jnp.asarray([[1, 2, 3, 4, 5, 6, 0, 0]], jnp.int32)
+    segments = jnp.asarray([[1, 1, 2, 2, 2, 2, 0, 0]], jnp.int32)
+    weights = jnp.asarray([[0, 1, .5, .25, .5, 1, 0, 0]], jnp.float32)
+
+    def check_loss(hidden, _head, targets, shifted_weights, **kwargs):
+        assert kwargs["cut_chunk_size"] == 3
+        assert hidden.shape == (1, 8, 4)
+        # Token 3 -> 4 crosses the SP boundary inside one document and keeps
+        # supervision. Token 1 -> 2 crosses documents and is excluded.
+        np.testing.assert_array_equal(targets[:, :6], [[2, 0, 4, 5, 6, 0]])
+        np.testing.assert_array_equal(shifted_weights, [[1, 0, .25, .5, 1, 0, 0, 0]])
+        return jnp.asarray(3.0), jnp.sum(shifted_weights)
+
+    monkeypatch.setattr(loss_module, "fused_linear_cross_entropy", check_loss)
+    result = chunked_causal_lm_loss(
+        jnp.zeros((1, 8, 4)), jnp.zeros((4, 8)), ids, ids != 0,
+        segment_ids=segments, loss_weights=weights, loss_implementation="cut",
+        mesh=MeshShape(), cut_chunk_size=3,
+    )
+    np.testing.assert_allclose(result[1], 2.75)
 
 
 def test_shifted_mask_excludes_padding_and_packed_boundaries() -> None:

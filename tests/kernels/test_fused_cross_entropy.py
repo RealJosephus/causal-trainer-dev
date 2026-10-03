@@ -6,8 +6,40 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from causal_trainer.kernels.fused_cross_entropy import fused_linear_cross_entropy
+
+
+@pytest.mark.parametrize("chunk_size", [0, 17])
+def test_cut_local_chunk_option_is_forwarded_only_when_enabled(monkeypatch, chunk_size):
+    import causal_trainer.kernels.cut_cross_entropy as cut_module
+
+    def cut(hidden, head, targets, weights, **kwargs):
+        if chunk_size:
+            assert kwargs["local_chunk_size"] == chunk_size
+        else:
+            assert "local_chunk_size" not in kwargs
+        assert kwargs["sparse_compaction"] is True
+        assert hidden.dtype == head.dtype == jnp.bfloat16
+        return jnp.sum(weights), jnp.sum(weights)
+
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    monkeypatch.setattr(cut_module, "pallas_cut_linear_cross_entropy", cut)
+    fused_linear_cross_entropy(
+        jnp.ones((1, 8, 128)), jnp.ones((128, 256)),
+        jnp.zeros((1, 8), jnp.int32), jnp.ones((1, 8)),
+        implementation="cut", mesh=object(), sparse_skip=True, cut_chunk_size=chunk_size,
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [-1, True, 1.5])
+def test_invalid_cut_local_chunk_size_is_rejected(chunk_size):
+    with pytest.raises(ValueError, match="cut_chunk_size"):
+        fused_linear_cross_entropy(
+            jnp.ones((1, 1, 4)), jnp.ones((4, 8)),
+            jnp.zeros((1, 1), jnp.int32), jnp.ones((1, 1)), cut_chunk_size=chunk_size,
+        )
 
 
 def _iter_jaxpr_equations(value: Any) -> Iterator[Any]:

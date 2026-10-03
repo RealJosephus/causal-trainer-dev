@@ -27,6 +27,12 @@ from .rotary import (
     inverse_frequencies,
     rotary_cos_sin,
 )
+from .token_tiling import (
+    tiled_final_norm,
+    tiled_norm_mlp,
+    tiled_norm_qkv,
+    tiled_output_projection,
+)
 
 Array = jax.Array
 Params = Mapping[str, Any]
@@ -397,6 +403,107 @@ def _stack_layer_trees(
     return jax.tree.map(lambda *leaves: jnp.stack(leaves, axis=0), *layers)
 
 
+def _tiled_decoder_layer(
+    layer_params: Params,
+    layer_adapters: Params | None,
+    hidden_states: Array,
+    attention_mask: Array,
+    rotary_cosine: Array,
+    rotary_sine: Array,
+    segment_ids: Array,
+    attention_metadata: AttentionMetadata | None,
+    dropout_rng: Array | None,
+    *,
+    config: ModelConfig,
+    implementation: AttentionImplementation,
+    mesh: Mesh,
+    block_q: int,
+    block_k: int,
+    attention_profile: AttentionKernelProfile | None,
+    chunk_size: int,
+    mlp_chunk_size: int,
+) -> Array:
+    """Keep sequence/hidden shards across layers; gather only token tiles.
+
+    Attention still sees the original packed sequence order and canonical
+    segment IDs. This path changes storage/recomputation, not the causal mask.
+    """
+
+    query, key, value = tiled_norm_qkv(
+        hidden_states,
+        layer_params["input_layernorm"]["scale"],
+        layer_params["attention"],
+        mesh=mesh,
+        rms_norm_eps=config.rms_norm_eps,
+        num_attention_heads=config.num_attention_heads,
+        num_key_value_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        chunk_size=chunk_size,
+    )
+    query, key = apply_rotary_cos_sin(
+        query, key, rotary_cosine, rotary_sine, rope_style=config.rope_style,
+    )
+    attended = _attention_precanonicalized(
+        query,
+        key,
+        value,
+        attention_mask,
+        segment_ids,
+        implementation=implementation,
+        scale=config.head_dim**-0.5,
+        dropout_rate=0.0,
+        deterministic=True,
+        mesh=mesh,
+        block_q=block_q,
+        block_k=block_k,
+        attention_metadata=attention_metadata,
+        attention_profile=attention_profile,
+    )
+    attended = attended.reshape(*hidden_states.shape[:2], config.query_width)
+    hidden_states = hidden_states + tiled_output_projection(
+        attended, layer_params["attention"]["o_proj"], mesh=mesh, chunk_size=chunk_size,
+    )
+    hidden_states = hidden_states + tiled_norm_mlp(
+        hidden_states,
+        layer_params["post_attention_layernorm"]["scale"],
+        layer_params["mlp"],
+        mesh=mesh,
+        rms_norm_eps=config.rms_norm_eps,
+        chunk_size=mlp_chunk_size or hidden_states.shape[1] // int(mesh.shape["sp"]),
+    )
+    return jax.lax.with_sharding_constraint(
+        hidden_states, NamedSharding(mesh, PartitionSpec("dp", "sp", "tp")),
+    )
+
+
+def _grouped_layer_scan(scan_layer, hidden_states: Array, scan_inputs, layers_per_group: int) -> Array:
+    """Checkpoint group boundaries, recovering inner layer inputs on demand.
+
+    For L layers in groups of G, reverse mode keeps approximately L/G outer
+    boundaries plus G inner boundaries, instead of all L layer inputs. The
+    caller checkpoints each layer body as well, so attention/MLP residuals
+    are not retained across the group. No host offload is involved.
+    """
+
+    layers = jax.tree.leaves(scan_inputs)[0].shape[0]
+    if layers % layers_per_group:
+        raise ValueError("layers_per_group must divide num_hidden_layers")
+    grouped_inputs = jax.tree.map(
+        lambda x: x.reshape(layers // layers_per_group, layers_per_group, *x.shape[1:]),
+        scan_inputs,
+    )
+
+    def scan_group(hidden, group_inputs):
+        hidden, _ = jax.lax.scan(scan_layer, hidden, group_inputs)
+        return hidden, None
+
+    scan_group = jax.checkpoint(
+        scan_group, policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False,
+    )
+    hidden_states, _ = jax.lax.scan(scan_group, hidden_states, grouped_inputs)
+    return hidden_states
+
+
 def decoder_forward(
     params: Params,
     config: ModelConfig,
@@ -417,6 +524,8 @@ def decoder_forward(
     mlp_chunk_size: int = 0,
     gather_kv_projection_weights: bool = False,
     scan_layers: bool = False,
+    projection_chunk_size: int = 0,
+    remat_group_size: int = 1,
 ) -> Array:
     """Run the decoder and return final normalized hidden states.
 
@@ -427,6 +536,14 @@ def decoder_forward(
     ``scan_layers`` only changes the internal compute representation. The
     checkpoint-facing layer tuple is stacked on entry and autodiff maps its
     gradients back to that unchanged tuple tree.
+
+    ``projection_chunk_size`` tiles QKV/output projections and final norm,
+    retaining TP feature shards between layers. Its MLP independently uses
+    ``mlp_chunk_size``, with zero covering the full SP-local sequence.
+    This projection layout always gathers K/V weights; the
+    ``gather_kv_projection_weights`` switch applies to ordinary projections.
+    ``remat_group_size`` independently checkpoints groups of scanned layers.
+    Their defaults preserve ordinary execution.
     """
 
     if remat_policy not in ("none", "nothing_saveable"):
@@ -443,6 +560,43 @@ def decoder_forward(
         raise TypeError("gather_kv_projection_weights must be a static bool")
     if not isinstance(scan_layers, bool):
         raise TypeError("scan_layers must be a static bool")
+    for name, value, minimum in (
+        ("projection_chunk_size", projection_chunk_size, 0), ("remat_group_size", remat_group_size, 1),
+    ):
+        if isinstance(value, bool):
+            raise TypeError(f"{name} must be a static integer")
+        try:
+            integer = operator.index(value)
+        except TypeError as error:
+            raise TypeError(f"{name} must be a static integer") from error
+        if integer < minimum:
+            raise ValueError(f"{name} must be at least {minimum}")
+    projection_chunk_size = operator.index(projection_chunk_size)
+    remat_group_size = operator.index(remat_group_size)
+    if remat_group_size > 1:
+        if not scan_layers or remat_policy != "nothing_saveable":
+            raise ValueError("remat_group_size>1 requires scan_layers=True and remat_policy=nothing_saveable")
+        if config.num_hidden_layers % remat_group_size:
+            raise ValueError("remat_group_size must divide num_hidden_layers")
+    tiled_execution = projection_chunk_size > 0
+    if tiled_execution:
+        if mesh is None:
+            raise ValueError("tiled execution requires a mesh")
+        if any(int(mesh.shape.get(axis, 1)) != 1 for axis in ("dp", "fsdp", "ep")):
+            raise ValueError("tiled execution requires DP=FSDP=EP=1")
+        if not {"dp", "fsdp", "ep", "tp", "sp"}.issubset(mesh.axis_names):
+            raise ValueError("tiled execution requires the dp,fsdp,ep,tp,sp mesh axes")
+        if lora_params is not None:
+            raise ValueError("tiled execution requires full-parameter training")
+        if not deterministic or config.attention_dropout != 0:
+            raise ValueError("tiled execution requires deterministic attention with dropout=0")
+        if jnp.dtype(compute_dtype) != jnp.dtype(jnp.bfloat16):
+            raise ValueError("tiled execution requires bfloat16 compute")
+        if any(leaf.dtype != jnp.bfloat16 for leaf in jax.tree.leaves(params)):
+            raise ValueError("tiled execution requires bfloat16 parameters")
+        # Vanilla is retained as a small CPU numerical reference.
+        if implementation not in ("efficient", "vanilla"):
+            raise ValueError("tiled execution requires efficient attention (or vanilla for reference tests)")
     if gather_kv_projection_weights:
         if mesh is None:
             raise ValueError("gather_kv_projection_weights requires a mesh")
@@ -452,6 +606,7 @@ def decoder_forward(
         mesh is not None
         and int(mesh.shape.get("sp", 1)) > 1
         and mlp_chunk_size > 0
+        and not tiled_execution
     ):
         raise ValueError(
             "mlp_chunk_size must be 0 when SP>1 because tiled MLP currently "
@@ -484,6 +639,7 @@ def decoder_forward(
             (batch, sequence, config.num_attention_heads, config.head_dim),
             (batch, sequence, config.num_key_value_heads, config.head_dim),
             mesh,
+            **({"compact_statistics": True} if tiled_execution else {}),
         )
         attention_metadata = prepare_attention_metadata(
             canonical_segment_ids,
@@ -514,6 +670,12 @@ def decoder_forward(
         config.pad_token_id,
         compute_dtype,
     )
+    if tiled_execution:
+        if batch != 1:
+            raise ValueError("tiled execution requires batch size 1")
+        hidden_states = jax.lax.with_sharding_constraint(
+            hidden_states, NamedSharding(mesh, PartitionSpec("dp", "sp", "tp")),
+        )
     parameter_layers = tuple(params["layers"])
     if len(parameter_layers) != config.num_hidden_layers:
         raise ValueError(
@@ -546,6 +708,18 @@ def decoder_forward(
         mlp_chunk_size=mlp_chunk_size,
         gather_kv_projection_weights=gather_kv_projection_weights,
     )
+    if tiled_execution:
+        layer_function = partial(
+            _tiled_decoder_layer,
+            config=config,
+            implementation=implementation,
+            mesh=mesh,
+            block_q=block_q,
+            block_k=block_k,
+            attention_profile=attention_profile,
+            chunk_size=projection_chunk_size,
+            mlp_chunk_size=mlp_chunk_size,
+        )
     if remat_policy == "nothing_saveable":
         layer_function = jax.checkpoint(
             layer_function,
@@ -588,7 +762,12 @@ def decoder_forward(
             )
             return hidden, None
 
-        hidden_states, _ = jax.lax.scan(scan_layer, hidden_states, scan_inputs)
+        if remat_group_size > 1:
+            hidden_states = _grouped_layer_scan(
+                scan_layer, hidden_states, scan_inputs, remat_group_size,
+            )
+        else:
+            hidden_states, _ = jax.lax.scan(scan_layer, hidden_states, scan_inputs)
     else:
         adapters = (
             (None,) * config.num_hidden_layers
@@ -618,6 +797,11 @@ def decoder_forward(
                 layer_rng,
             )
 
+    if tiled_execution:
+        return tiled_final_norm(
+            hidden_states, params["norm"]["scale"], mesh=mesh,
+            rms_norm_eps=config.rms_norm_eps, chunk_size=projection_chunk_size,
+        )
     return rms_norm(hidden_states, params["norm"]["scale"], config.rms_norm_eps, compute_dtype)
 
 
@@ -641,6 +825,8 @@ def forward(
     mlp_chunk_size: int = 0,
     gather_kv_projection_weights: bool = False,
     scan_layers: bool = False,
+    projection_chunk_size: int = 0,
+    remat_group_size: int = 1,
 ) -> Array:
     """Return causal language-model logits in ``[batch, sequence, vocab]``."""
 
@@ -663,6 +849,8 @@ def forward(
         mlp_chunk_size=mlp_chunk_size,
         gather_kv_projection_weights=gather_kv_projection_weights,
         scan_layers=scan_layers,
+        projection_chunk_size=projection_chunk_size,
+        remat_group_size=remat_group_size,
     )
     if config.tie_word_embeddings:
         lm_head = {"kernel": params["embed_tokens"]["embedding"].T}
