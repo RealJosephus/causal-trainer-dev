@@ -90,6 +90,68 @@ def test_generation_trailing_whitespace_does_not_mask_a_later_user_span() -> Non
     assert encoded["assistant_masks"] == [0, 0, 0, 1, 0, 0]
 
 
+def test_message_loss_flags_filter_spans_without_changing_rendered_tokens() -> None:
+    tokenizer = TrainingTokenizer(
+        _backend(),
+        chat_template=(
+            "{% for turn in messages %}{{ turn.role + ' ' }}"
+            "{% if turn.role == 'assistant' %}"
+            "{% generation %}{{ turn.content + ' eos ' }}{% endgeneration %}"
+            "{% else %}{{ turn.content + ' ' }}{% endif %}{% endfor %}"
+        ),
+    )
+    messages = [
+        {"role": "user", "content": "question", "loss": False},
+        {"role": "assistant", "content": "answer", "loss": False},
+        {"role": "assistant", "content": "answer"},
+    ]
+
+    unfiltered = tokenizer.apply_chat_template(
+        [{key: value for key, value in message.items() if key != "loss"} for message in messages],
+        return_assistant_tokens_mask=True,
+    )
+    filtered = tokenizer.apply_chat_template(
+        messages,
+        return_assistant_tokens_mask=True,
+    )
+
+    assert filtered["input_ids"] == unfiltered["input_ids"]
+    assert unfiltered["assistant_masks"] == [0, 0, 0, 1, 1, 0, 1, 1]
+    assert filtered["assistant_masks"] == [0, 0, 0, 0, 0, 0, 1, 1]
+
+
+def test_message_loss_requires_one_generation_block_per_assistant() -> None:
+    tokenizer = TrainingTokenizer(
+        _backend(),
+        chat_template=(
+            "{% generation %}{{ 'answer ' }}{% endgeneration %}"
+            "{% generation %}{{ 'eos' }}{% endgeneration %}"
+        ),
+    )
+    messages = [{"role": "assistant", "content": "answer", "loss": False}]
+
+    with pytest.raises(ValueError, match="exactly one generation block"):
+        tokenizer.apply_chat_template(
+            messages,
+            return_assistant_tokens_mask=True,
+        )
+
+
+def test_message_loss_flags_remains_an_ordinary_template_kwarg() -> None:
+    tokenizer = TrainingTokenizer(
+        _backend(),
+        chat_template="{{ message_loss_flags }}",
+    )
+
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "question"}],
+        tokenize=False,
+        message_loss_flags="template-owned value",
+    )
+
+    assert rendered == "template-owned value"
+
+
 def test_tokenizer_rejects_ids_outside_model_embedding_table() -> None:
     tokenizer = TrainingTokenizer(_backend())
     tokenizer.validate_model_vocabulary(8)

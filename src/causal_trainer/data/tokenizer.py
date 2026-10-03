@@ -34,6 +34,8 @@ class _AssistantTracker(Extension):
         environment.extend(activate_tracker=self.activate_tracker)
         self._rendered_blocks: list[str] | None = None
         self._generation_indices: list[tuple[int, int]] | None = None
+        self._generation_loss_flags: tuple[bool, ...] | None = None
+        self._generation_loss_index = 0
 
     def parse(self, parser: Any) -> jinja2.nodes.CallBlock:
         lineno = next(parser.stream).lineno
@@ -49,9 +51,19 @@ class _AssistantTracker(Extension):
     def _generation_support(self, context: Any, caller: Any) -> str:
         del context
         rendered = caller()
+        keep_span = True
+        if self._generation_loss_flags is not None:
+            if self._generation_loss_index >= len(self._generation_loss_flags):
+                raise ValueError(
+                    "message-level loss requires exactly one generation block "
+                    "per assistant message"
+                )
+            keep_span = self._generation_loss_flags[self._generation_loss_index]
+            self._generation_loss_index += 1
         if self._rendered_blocks is not None and self._generation_indices is not None:
             start = len("".join(self._rendered_blocks))
-            self._generation_indices.append((start, start + len(rendered)))
+            if keep_span:
+                self._generation_indices.append((start, start + len(rendered)))
         return rendered
 
     @contextmanager
@@ -59,16 +71,35 @@ class _AssistantTracker(Extension):
         self,
         rendered_blocks: list[str],
         generation_indices: list[tuple[int, int]],
+        generation_loss_flags: Sequence[bool] | None = None,
     ):
-        if self._rendered_blocks is not None or self._generation_indices is not None:
+        if (
+            self._rendered_blocks is not None
+            or self._generation_indices is not None
+            or self._generation_loss_flags is not None
+        ):
             raise RuntimeError("assistant span tracker is already active")
         self._rendered_blocks = rendered_blocks
         self._generation_indices = generation_indices
+        self._generation_loss_flags = (
+            None if generation_loss_flags is None else tuple(generation_loss_flags)
+        )
+        self._generation_loss_index = 0
         try:
             yield
+            if (
+                self._generation_loss_flags is not None
+                and self._generation_loss_index != len(self._generation_loss_flags)
+            ):
+                raise ValueError(
+                    "message-level loss requires exactly one generation block "
+                    "per assistant message"
+                )
         finally:
             self._rendered_blocks = None
             self._generation_indices = None
+            self._generation_loss_flags = None
+            self._generation_loss_index = 0
 
 
 def _raise_template_exception(message: str) -> None:
@@ -181,6 +212,8 @@ def _special_tokens_from_config(config: Mapping[str, Any]) -> dict[str, str | li
 
 class TrainingTokenizer:
     """Tokenizer interface intentionally limited to the trainer's data path."""
+
+    supports_message_loss = True
 
     def __init__(
         self,
@@ -374,11 +407,17 @@ class TrainingTokenizer:
     @staticmethod
     def _render_with_assistant_indices(
         template: jinja2.Template,
-        **template_kwargs: Any,
+        template_kwargs: Mapping[str, Any],
+        *,
+        generation_loss_flags: Sequence[bool] | None = None,
     ) -> tuple[str, list[tuple[int, int]]]:
         rendered_blocks: list[str] = []
         generation_indices: list[tuple[int, int]] = []
-        with template.environment.activate_tracker(rendered_blocks, generation_indices):
+        with template.environment.activate_tracker(
+            rendered_blocks,
+            generation_indices,
+            generation_loss_flags,
+        ):
             for block in template.generate(**template_kwargs):
                 rendered_blocks.append(block)
         return "".join(rendered_blocks), generation_indices
@@ -432,6 +471,14 @@ class TrainingTokenizer:
 
         source = self.get_chat_template(chat_template, normalized_tools)
         template = _compile_chat_template(source)
+        assistant_loss_flags = [
+            message.get("loss") is not False
+            for message in conversation
+            if message.get("role") == "assistant"
+        ]
+        generation_loss_flags = (
+            assistant_loss_flags if False in assistant_loss_flags else None
+        )
         template_values = {
             **self.special_tokens_map,
             **kwargs,
@@ -441,7 +488,11 @@ class TrainingTokenizer:
             "add_generation_prompt": add_generation_prompt,
         }
         if return_assistant_tokens_mask:
-            rendered, generation_indices = self._render_with_assistant_indices(template, **template_values)
+            rendered, generation_indices = self._render_with_assistant_indices(
+                template,
+                template_values,
+                generation_loss_flags=generation_loss_flags,
+            )
         else:
             rendered = template.render(**template_values)
             generation_indices = []

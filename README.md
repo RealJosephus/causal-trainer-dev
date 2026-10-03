@@ -117,6 +117,8 @@ Conversational records contain a `messages` field:
 
 Message records may also provide `tools` and `chat_template_kwargs` when the selected chat template requires them.
 
+When `--assistant_only_loss True` or `--last_assistant_only_loss True` is active, an assistant message may set an optional boolean `loss` field. `false` keeps that turn in the rendered context while excluding its chat-template generation span from supervision. A missing or null value remains trainable. Non-boolean, non-null assistant values are rejected. Datasets without assistant `loss` annotations retain the existing rendering and masking path unchanged. Selective message loss requires exactly one direct `{% generation %}` block per assistant message in the main message loop; do not hide these blocks inside macros or capture blocks.
+
 ### Offline prepared datasets
 
 Use `causal-prepare` on a separate, ordinary single machine to finish tokenization, optional packing, attention/position/segment masks, assistant loss masks, loss weights, and EndPrompt before the accelerator job starts. The command uses the existing dataset and tokenizer dependencies and does not import JAX, Transformers, PyTorch, or the training runtime.

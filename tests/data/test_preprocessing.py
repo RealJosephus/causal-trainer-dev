@@ -19,6 +19,7 @@ from causal_trainer.data.tokenizer import TrainingTokenizer
 class FakeTokenizer:
     eos_token = "<eos>"
     pad_token_id = 0
+    supports_message_loss = True
 
     def __init__(self) -> None:
         self.raw_calls = []
@@ -370,6 +371,216 @@ def test_messages_are_tokenized_directly_with_assistant_mask():
         "max_length": None,
     }
     assert output["assistant_masks"] == [0, 0, 1, 1]
+
+
+@pytest.mark.parametrize("loss", [0, 1, 0.0, "false", [], {}])
+def test_messages_reject_non_boolean_assistant_loss(loss) -> None:
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer", "loss": loss},
+    ]
+
+    with pytest.raises(ValueError, match=r"messages\[1\]\.loss.*boolean or null"):
+        tokenize_messages(
+            messages,
+            FakeTokenizer(),
+            max_sequence_length=32,
+            assistant_only_loss=True,
+        )
+
+
+def test_false_assistant_loss_requires_tokenizer_support() -> None:
+    tokenizer = FakeTokenizer()
+    tokenizer.supports_message_loss = False
+
+    with pytest.raises(ValueError, match="does not support assistant message loss=false"):
+        tokenize_messages(
+            [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer", "loss": False},
+            ],
+            tokenizer,
+            max_sequence_length=32,
+            assistant_only_loss=True,
+        )
+
+
+@pytest.mark.parametrize("loss", [True, None])
+def test_messages_true_or_null_loss_keeps_the_legacy_template_call(loss) -> None:
+    tokenizer = FakeTokenizer()
+    messages = [
+        {"role": "user", "content": "question", "loss": False},
+        {"role": "assistant", "content": "answer", "loss": loss},
+    ]
+
+    tokenize_messages(
+        messages,
+        tokenizer,
+        max_sequence_length=32,
+        assistant_only_loss=True,
+    )
+
+    assert "message_loss_flags" not in tokenizer.chat_calls[0][1]
+
+
+def test_message_loss_is_inert_without_an_assistant_loss_mode() -> None:
+    tokenizer = FakeTokenizer()
+    messages = [
+        {"role": "user", "content": "question", "loss": False},
+        {"role": "assistant", "content": "answer", "loss": "not used"},
+    ]
+
+    output = tokenize_messages(messages, tokenizer, max_sequence_length=32)
+
+    assert "message_loss_flags" not in tokenizer.chat_calls[0][1]
+    assert "assistant_masks" not in output
+
+
+def _native_message_loss_tokenizer() -> TrainingTokenizer:
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+
+    vocabulary = {
+        "unk": 0,
+        "user": 1,
+        "assistant": 2,
+        "question": 3,
+        "second": 4,
+        "context": 5,
+        "answer": 6,
+        "eos": 7,
+    }
+    backend = Tokenizer(WordLevel(vocabulary, unk_token="unk"))
+    backend.pre_tokenizer = WhitespaceSplit()
+    return TrainingTokenizer(
+        backend,
+        chat_template=(
+            "{% for message in messages %}{{ message.role + ' ' }}"
+            "{% if message.role == 'assistant' %}"
+            "{% generation %}{{ message.content + ' eos ' }}{% endgeneration %}"
+            "{% else %}{{ message.content + ' ' }}{% endif %}"
+            "{% endfor %}"
+        ),
+    )
+
+
+def test_real_dataset_treats_missing_arrow_loss_as_trainable() -> None:
+    datasets = pytest.importorskip("datasets")
+    dataset = datasets.Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "context", "loss": False},
+                ]
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ]
+            },
+        ]
+    )
+    assert dataset[1]["messages"][1]["loss"] is None
+
+    output = preprocess_dataset(
+        dataset,
+        _native_message_loss_tokenizer(),
+        dataset_text_field="messages",
+        max_sequence_length=16,
+        assistant_only_loss=True,
+    )
+
+    assert len(output) == 1
+    assert output[0]["input_ids"] == [1, 3, 2, 6, 7]
+    assert output[0]["assistant_masks"] == [0, 0, 0, 1, 1]
+
+
+def test_native_loss_true_and_null_match_the_unannotated_path() -> None:
+    tokenizer = _native_message_loss_tokenizer()
+    base = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+    ]
+
+    expected = tokenize_messages(
+        base,
+        tokenizer,
+        max_sequence_length=16,
+        assistant_only_loss=True,
+    )
+
+    for value in (True, None):
+        annotated = [dict(message) for message in base]
+        annotated[1]["loss"] = value
+        assert (
+            tokenize_messages(
+                annotated,
+                tokenizer,
+                max_sequence_length=16,
+                assistant_only_loss=True,
+            )
+            == expected
+        )
+
+
+def test_last_assistant_loss_does_not_fall_back_from_a_disabled_final_span() -> None:
+    output = tokenize_messages(
+        [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "context", "loss": False},
+        ],
+        _native_message_loss_tokenizer(),
+        max_sequence_length=16,
+        last_assistant_only_loss=True,
+    )
+
+    assert output == {
+        "input_ids": [],
+        "attention_mask": [],
+        "assistant_masks": [],
+    }
+
+
+def test_native_message_loss_respects_the_truncation_boundary() -> None:
+    tokenizer = _native_message_loss_tokenizer()
+    early_trainable = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "context", "loss": False},
+    ]
+    late_trainable = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "context", "loss": False},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "answer"},
+    ]
+
+    kept = tokenize_messages(
+        early_trainable,
+        tokenizer,
+        max_sequence_length=8,
+        assistant_only_loss=True,
+    )
+    filtered = tokenize_messages(
+        late_trainable,
+        tokenizer,
+        max_sequence_length=8,
+        assistant_only_loss=True,
+    )
+
+    assert kept["input_ids"] == [1, 3, 2, 6, 7]
+    assert kept["assistant_masks"] == [0, 0, 0, 1, 1]
+    assert filtered == {
+        "input_ids": [],
+        "attention_mask": [],
+        "assistant_masks": [],
+    }
 
 
 def test_assistant_only_trims_all_fields_at_last_trainable_token_in_prefix():

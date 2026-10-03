@@ -149,8 +149,29 @@ def _validate_messages(messages: Any) -> list[Mapping[str, Any]]:
     return normalized
 
 
-def _has_nonempty_assistant_content(messages: Sequence[Mapping[str, Any]]) -> bool:
-    return any(message.get("role") == "assistant" and bool(message.get("content")) for message in messages)
+def _validate_assistant_message_loss(
+    messages: Sequence[Mapping[str, Any]],
+) -> bool:
+    has_disabled_assistant = False
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        value = message.get("loss")
+        if value is not None and type(value) is not bool:
+            raise ValueError(f"messages[{index}].loss must be a boolean or null.")
+        has_disabled_assistant |= value is False
+    return has_disabled_assistant
+
+
+def _has_nonempty_trainable_assistant_content(
+    messages: Sequence[Mapping[str, Any]],
+) -> bool:
+    return any(
+        message.get("role") == "assistant"
+        and message.get("loss") is not False
+        and bool(message.get("content"))
+        for message in messages
+    )
 
 
 def _empty_tokenized_example(example: TokenizedExample) -> TokenizedExample:
@@ -490,9 +511,14 @@ def tokenize_messages(
     )
     use_assistant_mask = assistant_loss_mode is not None
     messages = _validate_messages(messages)
+    has_disabled_assistant = (
+        _validate_assistant_message_loss(messages) if use_assistant_mask else False
+    )
     apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
     if not callable(apply_chat_template):
         raise ValueError("The tokenizer must provide apply_chat_template for messages training.")
+    if has_disabled_assistant and not getattr(tokenizer, "supports_message_loss", False):
+        raise ValueError("The tokenizer does not support assistant message loss=false.")
 
     if isinstance(tools, str):
         tools = json.loads(tools)
@@ -523,7 +549,7 @@ def tokenize_messages(
         return output
 
     if not any(output["assistant_masks"]):
-        if _has_nonempty_assistant_content(messages):
+        if _has_nonempty_trainable_assistant_content(messages):
             raise ValueError(
                 f"{assistant_loss_mode} was requested, but the tokenized example contains no assistant tokens "
                 "despite having assistant content. Check that the tokenizer chat template contains "
@@ -531,7 +557,19 @@ def tokenize_messages(
             )
         return _empty_tokenized_example(output)
     if last_assistant_only_loss:
-        output["assistant_masks"] = _keep_last_assistant_span(output["assistant_masks"])
+        final_assistant_disabled = next(
+            (
+                message.get("loss") is False
+                for message in reversed(messages)
+                if message.get("role") == "assistant"
+            ),
+            False,
+        )
+        output["assistant_masks"] = (
+            [0] * len(output["assistant_masks"])
+            if final_assistant_disabled
+            else _keep_last_assistant_span(output["assistant_masks"])
+        )
     return _trim_to_last_assistant_token(output, max_sequence_length=max_sequence_length)
 
 
