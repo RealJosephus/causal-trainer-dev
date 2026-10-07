@@ -8,9 +8,19 @@ import optax
 
 from ..distributed.runtime import path_to_string
 from ..modeling.architecture import decoder_forward
+from ..modeling.attention_options import AttentionOptions
 from ..modeling.config import ModelConfig
 from ..modeling.freezing import compose_full_trainable_params
 from .losses import chunked_causal_lm_loss
+
+
+def _step_positions(step):
+    """Separate streaming LR progress from the absolute optimizer step.
+
+    Existing callers pass one scalar. Recovery-enabled streaming runs pass
+    (schedule progress, optimizer step), preserving the original LR schedule.
+    """
+    return step if isinstance(step, tuple) else (step, step)
 
 
 def make_train_step(
@@ -39,6 +49,7 @@ def make_train_step(
     projection_chunk_size: int = 0,
     remat_group_size: int = 1,
     cut_chunk_size: int = 0,
+    attention_options: AttentionOptions | None = None,
 ):
     if gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive")
@@ -73,7 +84,7 @@ def make_train_step(
     if remat_group_size > 1:
         decoder_options["remat_group_size"] = remat_group_size
 
-    def one_microbatch(params, batch):
+    def one_microbatch(params, batch, step):
         if projection_chunk_size:
             if any(value.dtype != jnp.dtype(jnp.bfloat16) for value in jax.tree.leaves(params)):
                 raise ValueError("projection_chunk_size requires BF16 parameters")
@@ -97,6 +108,7 @@ def make_train_step(
             gather_kv_projection_weights=gather_kv_projection_weights,
             scan_layers=scan_layers,
             **decoder_options,
+            **({"attention_options": attention_options, "attention_step": step} if attention_options else {}),
         )
         return chunked_causal_lm_loss(
             hidden_states,
@@ -115,12 +127,15 @@ def make_train_step(
         )
 
     def train_step(params, optimizer_state, batch, step):
+        step, attention_step = _step_positions(step)
         full_batch = batch["input_ids"].shape[0]
         if full_batch % gradient_accumulation_steps:
             raise ValueError("effective global batch is not divisible by gradient_accumulation_steps")
         micro_batch_size = full_batch // gradient_accumulation_steps
         if gradient_accumulation_steps == 1:
-            (nll_and_tokens, gradient_sums) = jax.value_and_grad(one_microbatch, has_aux=True)(params, batch)
+            (nll_and_tokens, gradient_sums) = jax.value_and_grad(one_microbatch, has_aux=True)(
+                params, batch, attention_step,
+            )
             nll_sum, token_count = nll_and_tokens
         else:
             # Accumulate in float32 only when it is requested. The common
@@ -134,7 +149,9 @@ def make_train_step(
                     lambda value: jax.lax.dynamic_slice_in_dim(value, start, micro_batch_size, axis=0),
                     batch,
                 )
-                (nll_and_tokens, grads) = jax.value_and_grad(one_microbatch, has_aux=True)(params, micro)
+                (nll_and_tokens, grads) = jax.value_and_grad(one_microbatch, has_aux=True)(
+                    params, micro, attention_step,
+                )
                 nll_sum, token_count = nll_and_tokens
                 grads = jax.tree.map(lambda grad: grad.astype(jnp.float32), grads)
                 accumulated_grads = jax.tree.map(jnp.add, accumulated_grads, grads)
@@ -215,13 +232,14 @@ def make_frozen_full_train_step(
     gather_kv_projection_weights: bool = False,
     scan_layers: bool = False,
     external_learning_rate: bool = False,
+    attention_options: AttentionOptions | None = None,
 ):
     """Build a full-rank step that excludes frozen leaves from autodiff and AdamW."""
 
     if gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive")
 
-    def one_microbatch(frozen_params, trainable_params, batch):
+    def one_microbatch(frozen_params, trainable_params, batch, step):
         forward_params = compose_full_trainable_params(frozen_params, trainable_params)
         hidden_states = decoder_forward(
             forward_params,
@@ -240,6 +258,7 @@ def make_frozen_full_train_step(
             mlp_chunk_size=mlp_chunk_size,
             gather_kv_projection_weights=gather_kv_projection_weights,
             scan_layers=scan_layers,
+            **({"attention_options": attention_options, "attention_step": step} if attention_options else {}),
         )
         return chunked_causal_lm_loss(
             hidden_states,
@@ -257,6 +276,7 @@ def make_frozen_full_train_step(
         )
 
     def train_step(frozen_params, trainable_params, optimizer_state, batch, step):
+        step, attention_step = _step_positions(step)
         full_batch = batch["input_ids"].shape[0]
         if full_batch % gradient_accumulation_steps:
             raise ValueError("effective global batch is not divisible by gradient_accumulation_steps")
@@ -266,7 +286,7 @@ def make_frozen_full_train_step(
                 one_microbatch,
                 argnums=1,
                 has_aux=True,
-            )(frozen_params, trainable_params, batch)
+            )(frozen_params, trainable_params, batch, attention_step)
             nll_sum, token_count = nll_and_tokens
         else:
             float_grads = jax.tree.map(
@@ -285,7 +305,7 @@ def make_frozen_full_train_step(
                     one_microbatch,
                     argnums=1,
                     has_aux=True,
-                )(frozen_params, trainable_params, micro)
+                )(frozen_params, trainable_params, micro, attention_step)
                 micro_nll, micro_tokens = nll_and_tokens
                 grads = jax.tree.map(lambda grad: grad.astype(jnp.float32), grads)
                 accumulated_grads = jax.tree.map(jnp.add, accumulated_grads, grads)
@@ -374,13 +394,14 @@ def make_lora_train_step(
     gather_kv_projection_weights: bool = False,
     scan_layers: bool = False,
     external_learning_rate: bool = False,
+    attention_options: AttentionOptions | None = None,
 ):
     """Build a step over adapters and, optionally, embedding/head leaves."""
 
     if gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive")
 
-    def one_microbatch(base_params, lora_params, batch):
+    def one_microbatch(base_params, lora_params, batch, step):
         if train_embed_and_lm_head:
             forward_params = dict(base_params)
             forward_params["embed_tokens"] = lora_params["embed_tokens"]
@@ -409,6 +430,7 @@ def make_lora_train_step(
             mlp_chunk_size=mlp_chunk_size,
             gather_kv_projection_weights=gather_kv_projection_weights,
             scan_layers=scan_layers,
+            **({"attention_options": attention_options, "attention_step": step} if attention_options else {}),
         )
         return chunked_causal_lm_loss(
             hidden_states,
@@ -426,6 +448,7 @@ def make_lora_train_step(
         )
 
     def train_step(base_params, lora_params, optimizer_state, batch, step):
+        step, attention_step = _step_positions(step)
         full_batch = batch["input_ids"].shape[0]
         if full_batch % gradient_accumulation_steps:
             raise ValueError("effective global batch is not divisible by gradient_accumulation_steps")
@@ -435,7 +458,7 @@ def make_lora_train_step(
                 one_microbatch,
                 argnums=1,
                 has_aux=True,
-            )(base_params, lora_params, batch)
+            )(base_params, lora_params, batch, attention_step)
             nll_sum, token_count = nll_and_tokens
         else:
             float_grads = jax.tree.map(
@@ -454,7 +477,7 @@ def make_lora_train_step(
                     one_microbatch,
                     argnums=1,
                     has_aux=True,
-                )(base_params, lora_params, micro)
+                )(base_params, lora_params, micro, attention_step)
                 micro_nll, micro_tokens = nll_and_tokens
                 grads = jax.tree.map(lambda grad: grad.astype(jnp.float32), grads)
                 accumulated_grads = jax.tree.map(jnp.add, accumulated_grads, grads)

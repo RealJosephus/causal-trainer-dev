@@ -312,6 +312,41 @@ The default `efficient` backend uses a tiled custom kernel with online softmax a
 
 Official JAX Splash is available as an independent backend selected with `--attn_mechanism splash`. The `--block_size_q` and `--block_size_k` options apply to Splash only. The `vanilla` backend provides a reference implementation for numerical checks.
 
+### Optional MoBA
+
+`--attention_method dense` is the default. MoBA is an optional approximation that preserves the existing MQA projections, parameter layout, and RoPE settings. Changing a tuning parameter alone does not enable MoBA.
+
+Enable MoBA in addition to the existing training arguments:
+
+```bash
+# MoBA on every layer; top-k includes the mandatory current block.
+--attention_method moba \
+--moba_block_size 4096 \
+--moba_top_k 12
+```
+
+`--attn_mechanism` selects the dense backend for retained dense layers and dense recovery. Approximate layers use Pallas forward/backward kernels on TPU and the JAX reference on CPU. Explicit `--attention_sparse_backend pallas` requires Pallas; kernel errors do not trigger a reference fallback. MoBA requires MQA and zero stochastic attention dropout. The Pallas kernels require head dimension 128.
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `attention_method` | `dense` | `dense` or `moba`. |
+| `attention_sparse_backend` | `auto` | Pallas on TPU, reference on CPU; explicit `pallas` / `reference` overrides. |
+| `moba_block_size` | 4096 | Tokens per sample-relative routing block. |
+| `moba_top_k` | 12 | Maximum selected blocks per Query/head, including the current block. |
+| `attention_query_chunk_size` | 64 | Query workspace tile. Pallas rounds up to fill 128 matrix rows across local heads. |
+| `attention_key_chunk_size` | 512 | KV DMA/softmax tile; Pallas uses 128-aligned tiles. Independent of the routing block size. |
+| `attention_dense_prefix_layers` | 0 | First layers kept dense. |
+| `attention_dense_suffix_layers` | 0 | Last layers kept dense. |
+| `attention_dense_after_step` | unset | Switch all layers to the chosen dense backend at this zero-based optimizer step. |
+
+Dashed spellings such as `--attention-method` are also accepted. Dense prefix and suffix counts must fit within the model's layer count. For example, `--attention_dense_suffix_layers 4` retains four dense layers at the end of the model.
+
+**MoBA.** Each sample starts its own block grid. Each Query head selects up to `top_k - 1` completed historical blocks using their mean Keys and includes its current block with a causal mask. One softmax covers all selected tokens. A budget covering the entire sample history recovers dense connections. This follows [MoBA](https://arxiv.org/abs/2502.13189), adapted to shared MQA Keys and Values.
+
+MoBA uses the existing token batch and supports `text`, `messages`, packing, message loss weights, assistant-only loss, EndPrompt position jumps, prepared datasets, and streaming. Full updates, LoRA, frozen components, gradient accumulation, scanning/rematerialization, and loss backends retain their existing behavior and restrictions. Routing follows physical token order and sample boundaries independently of supervision masks.
+
+`--attention_dense_after_step 12000` switches to dense attention at zero-based optimizer step 12000 while keeping optimizer state, data order, and the LR schedule. Resume with the same attention options to preserve the phase and counter. Exported weights retain the standard dense/MQA parameter layout.
+
 ### Cross-entropy
 
 The default loss selection is:

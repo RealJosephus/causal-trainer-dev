@@ -18,6 +18,7 @@ from ..kernels.efficient_attention import (
     resolve_attention_profile,
 )
 from .attention import AttentionImplementation, _attention_precanonicalized
+from .attention_options import AttentionOptions
 from .config import ModelConfig
 from .lora import lora_linear_delta
 from .rotary import (
@@ -37,6 +38,17 @@ from .token_tiling import (
 Array = jax.Array
 Params = Mapping[str, Any]
 RematPolicy = Literal["none", "nothing_saveable"]
+
+
+def _dense_attention_layer(options, layer_index, layers, step):
+    if options is None or not options.needs_dense_backend:
+        return False
+    if options.method == "dense":
+        return True
+    selected = (layer_index < options.dense_prefix_layers) | (layer_index >= layers - options.dense_suffix_layers)
+    if options.dense_after_step is not None:
+        selected = selected | (step >= options.dense_after_step)
+    return selected
 
 
 def _shape(shape: tuple[int, ...], dtype: jnp.dtype) -> jax.ShapeDtypeStruct:
@@ -270,6 +282,7 @@ def _decoder_layer(
     segment_ids: Array,
     attention_metadata: AttentionMetadata | None,
     dropout_rng: Array | None,
+    layer_index: int | Array = 0,
     *,
     config: ModelConfig,
     implementation: AttentionImplementation,
@@ -281,6 +294,8 @@ def _decoder_layer(
     attention_profile: AttentionKernelProfile | None,
     mlp_chunk_size: int,
     gather_kv_projection_weights: bool,
+    attention_options: AttentionOptions | None = None,
+    attention_step: int | Array = 0,
 ) -> Array:
     def adapter(block: str, projection: str) -> Params | None:
         if layer_adapters is None:
@@ -361,6 +376,10 @@ def _decoder_layer(
         block_k=block_k,
         attention_metadata=attention_metadata,
         attention_profile=attention_profile,
+        attention_options=attention_options,
+        dense_attention=_dense_attention_layer(
+            attention_options, layer_index, config.num_hidden_layers, attention_step,
+        ),
     )
     attended = attended.reshape(batch, sequence, config.query_width)
     hidden_states = residual + linear(
@@ -413,6 +432,7 @@ def _tiled_decoder_layer(
     segment_ids: Array,
     attention_metadata: AttentionMetadata | None,
     dropout_rng: Array | None,
+    layer_index: int | Array = 0,
     *,
     config: ModelConfig,
     implementation: AttentionImplementation,
@@ -422,6 +442,8 @@ def _tiled_decoder_layer(
     attention_profile: AttentionKernelProfile | None,
     chunk_size: int,
     mlp_chunk_size: int,
+    attention_options: AttentionOptions | None = None,
+    attention_step: int | Array = 0,
 ) -> Array:
     """Keep sequence/hidden shards across layers; gather only token tiles.
 
@@ -458,6 +480,10 @@ def _tiled_decoder_layer(
         block_k=block_k,
         attention_metadata=attention_metadata,
         attention_profile=attention_profile,
+        attention_options=attention_options,
+        dense_attention=_dense_attention_layer(
+            attention_options, layer_index, config.num_hidden_layers, attention_step,
+        ),
     )
     attended = attended.reshape(*hidden_states.shape[:2], config.query_width)
     hidden_states = hidden_states + tiled_output_projection(
@@ -526,6 +552,8 @@ def decoder_forward(
     scan_layers: bool = False,
     projection_chunk_size: int = 0,
     remat_group_size: int = 1,
+    attention_options: AttentionOptions | None = None,
+    attention_step: int | Array = 0,
 ) -> Array:
     """Run the decoder and return final normalized hidden states.
 
@@ -546,6 +574,10 @@ def decoder_forward(
     Their defaults preserve ordinary execution.
     """
 
+    if attention_options is not None:
+        attention_options.validate_layers(config.num_hidden_layers)
+        if attention_options.method == "dense":
+            attention_options = None
     if remat_policy not in ("none", "nothing_saveable"):
         raise ValueError(f"unsupported remat policy: {remat_policy!r}")
     if isinstance(mlp_chunk_size, bool):
@@ -632,7 +664,7 @@ def decoder_forward(
     if segment_ids is not None and jnp.shape(segment_ids) != input_ids.shape:
         raise ValueError(f"segment_ids must have shape {input_ids.shape}, got {jnp.shape(segment_ids)}")
     canonical_segment_ids = canonicalize_segment_ids(attention_mask, segment_ids)
-    if implementation == "efficient":
+    if implementation == "efficient" and (attention_options is None or attention_options.needs_dense_backend):
         if mesh is None:
             raise ValueError("efficient decoder attention requires the training Mesh")
         attention_profile = resolve_attention_profile(
@@ -707,6 +739,8 @@ def decoder_forward(
         attention_profile=attention_profile,
         mlp_chunk_size=mlp_chunk_size,
         gather_kv_projection_weights=gather_kv_projection_weights,
+        attention_options=attention_options,
+        attention_step=attention_step,
     )
     if tiled_execution:
         layer_function = partial(
@@ -719,6 +753,8 @@ def decoder_forward(
             attention_profile=attention_profile,
             chunk_size=projection_chunk_size,
             mlp_chunk_size=mlp_chunk_size,
+            attention_options=attention_options,
+            attention_step=attention_step,
         )
     if remat_policy == "nothing_saveable":
         layer_function = jax.checkpoint(
@@ -747,6 +783,8 @@ def decoder_forward(
             )
         if layer_rngs is not None:
             scan_inputs["rng"] = layer_rngs
+        if attention_options is not None:
+            scan_inputs["layer_index"] = jnp.arange(config.num_hidden_layers, dtype=jnp.int32)
 
         def scan_layer(hidden: Array, layer_inputs: dict[str, Any]) -> tuple[Array, None]:
             hidden = layer_function(
@@ -759,6 +797,7 @@ def decoder_forward(
                 canonical_segment_ids,
                 attention_metadata,
                 layer_inputs.get("rng"),
+                layer_inputs.get("layer_index", 0),
             )
             return hidden, None
 
@@ -779,12 +818,12 @@ def decoder_forward(
             if layer_rngs is None
             else tuple(layer_rngs)
         )
-        for layer_params, layer_adapter, layer_rng in zip(
+        for layer_index, (layer_params, layer_adapter, layer_rng) in enumerate(zip(
             parameter_layers,
             adapters,
             rngs,
             strict=True,
-        ):
+        )):
             hidden_states = layer_function(
                 layer_params,
                 layer_adapter,
@@ -795,6 +834,7 @@ def decoder_forward(
                 canonical_segment_ids,
                 attention_metadata,
                 layer_rng,
+                layer_index,
             )
 
     if tiled_execution:
@@ -827,6 +867,8 @@ def forward(
     scan_layers: bool = False,
     projection_chunk_size: int = 0,
     remat_group_size: int = 1,
+    attention_options: AttentionOptions | None = None,
+    attention_step: int | Array = 0,
 ) -> Array:
     """Return causal language-model logits in ``[batch, sequence, vocab]``."""
 
@@ -851,6 +893,8 @@ def forward(
         scan_layers=scan_layers,
         projection_chunk_size=projection_chunk_size,
         remat_group_size=remat_group_size,
+        attention_options=attention_options,
+        attention_step=attention_step,
     )
     if config.tie_word_embeddings:
         lm_head = {"kernel": params["embed_tokens"]["embedding"].T}

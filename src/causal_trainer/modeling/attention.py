@@ -12,7 +12,11 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
     CausalMask,
     MultiHeadMask,
     SegmentIds,
+)
+from jax.experimental.pallas.ops.tpu.splash_attention import (
     make_splash_mqa as make_splash_attention,
+)
+from jax.experimental.pallas.ops.tpu.splash_attention import (
     make_splash_mqa_single_device as make_splash_attention_single_device,
 )
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -24,6 +28,7 @@ from ..kernels.efficient_attention import (
     prepare_attention_metadata,
     resolve_attention_profile,
 )
+from .attention_options import AttentionOptions
 from .config import validate_splash_block_size
 from .rotary import canonicalize_segment_ids
 
@@ -352,6 +357,8 @@ def _attention_precanonicalized(
     mesh: Mesh | None = None,
     attention_metadata: AttentionMetadata | None = None,
     attention_profile: AttentionKernelProfile | None = None,
+    attention_options: AttentionOptions | None = None,
+    dense_attention: bool | Array = False,
 ) -> Array:
     """Validate tensors and dispatch using canonical packed segment IDs."""
 
@@ -365,6 +372,31 @@ def _attention_precanonicalized(
     if segments.shape != query.shape[:2]:
         raise ValueError(f"segment_ids must have shape {query.shape[:2]}, got {segments.shape}")
     scale = query.shape[-1] ** -0.5 if scale is None else scale
+
+    if attention_options is not None and attention_options.method != "dense":
+        if key.shape[2] != 1:
+            raise ValueError("MoBA requires MQA (num_key_value_heads=1)")
+        if dropout_rate and not deterministic:
+            raise ValueError("MoBA requires zero attention dropout")
+        from .approximate_attention import moba_attention
+
+        def approximate(_):
+            return moba_attention(query, key, value, segments, options=attention_options, scale=scale, mesh=mesh)
+
+        if isinstance(dense_attention, bool) and not dense_attention:
+            return approximate(None)
+
+        def dense(_):
+            return _attention_precanonicalized(
+                query, key, value, valid, segments, implementation=implementation, scale=scale,
+                dropout_rate=dropout_rate, deterministic=deterministic, dropout_rng=dropout_rng,
+                block_q=block_q, block_k=block_k, mesh=mesh,
+                attention_metadata=attention_metadata, attention_profile=attention_profile,
+            )
+
+        if isinstance(dense_attention, bool):
+            return dense(None)
+        return jax.lax.cond(dense_attention, dense, approximate, None)
 
     if implementation == "efficient":
         if dropout_rate and not deterministic:
@@ -442,6 +474,7 @@ def attention(
     block_k: int = 128,
     mesh: Mesh | None = None,
     attention_profile: AttentionKernelProfile | None = None,
+    attention_options: AttentionOptions | None = None,
 ) -> Array:
     """Canonicalize packed segments and dispatch to the selected backend."""
 
@@ -462,4 +495,5 @@ def attention(
         block_k=block_k,
         mesh=mesh,
         attention_profile=attention_profile,
+        attention_options=attention_options,
     )

@@ -6,6 +6,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..modeling.attention_options import AttentionOptions
+
 _FROZEN_PARAMETER_COMPONENTS = ("lm_head", "embed", "norm")
 
 
@@ -132,6 +134,27 @@ class TrainingArguments:
     projection_chunk_size: int = 0
     remat_group_size: int = 1
     cut_chunk_size: int = 0
+    attention_method: str = "dense"
+    attention_sparse_backend: str = "auto"
+    attention_query_chunk_size: int = 64
+    attention_key_chunk_size: int = 512
+    moba_block_size: int = 4096
+    moba_top_k: int = 12
+    attention_dense_prefix_layers: int = 0
+    attention_dense_suffix_layers: int = 0
+    attention_dense_after_step: int | None = None
+
+    @property
+    def attention_options(self) -> AttentionOptions | None:
+        options = AttentionOptions(
+            method=self.attention_method, backend=self.attention_sparse_backend,
+            query_chunk_size=self.attention_query_chunk_size,
+            key_chunk_size=self.attention_key_chunk_size,
+            moba_block_size=self.moba_block_size, moba_top_k=self.moba_top_k,
+            dense_prefix_layers=self.attention_dense_prefix_layers,
+            dense_suffix_layers=self.attention_dense_suffix_layers, dense_after_step=self.attention_dense_after_step,
+        )
+        return None if options.method == "dense" else options
 
     @property
     def effective_batch_size(self) -> int:
@@ -327,6 +350,21 @@ def build_parser() -> argparse.ArgumentParser:
             "'splash' selects the official JAX implementation and 'vanilla' provides reference checks."
         ),
     )
+    _add(parser, "attention_method", choices=("dense", "moba"), default="dense",
+         help="Opt-in attention approximation, independent of the dense attention backend.")
+    _add(parser, "attention_sparse_backend", choices=("auto", "pallas", "reference"), default="auto",
+         help="Sparse kernel: auto uses Pallas on TPU and the numerical reference on CPU; no TPU fallback.")
+    for name, default, help_text in (
+        ("attention_query_chunk_size", 64, "Sparse attention query workspace tile."),
+        ("attention_key_chunk_size", 512, "Sparse attention key workspace tile."),
+        ("moba_block_size", 4096, "Sample-relative MoBA routing block size."),
+        ("moba_top_k", 12, "MoBA block budget per query/head, including its current block."),
+        ("attention_dense_prefix_layers", 0, "Leading layers kept on the original dense backend."),
+        ("attention_dense_suffix_layers", 0, "Trailing layers kept on the original dense backend."),
+    ):
+        _add(parser, name, type=int, default=default, help=help_text)
+    _add(parser, "attention_dense_after_step", type=int, default=None,
+         help="Use dense attention starting at this zero-based optimizer step (including after resume).")
     _add(
         parser,
         "block_size_q",
@@ -561,6 +599,7 @@ def parse_args(argv: list[str] | None = None) -> TrainingArguments:
             parse_frozen_parameter_components(namespace.frozen_parameters)
         )
     args = TrainingArguments(**vars(namespace))
+    _ = args.attention_options  # Validate algorithm options before model/data loading.
     if args.projection_chunk_size < 0 or args.cut_chunk_size < 0 or args.remat_group_size < 1:
         raise ValueError(
             "projection_chunk_size and cut_chunk_size must be nonnegative; remat_group_size must be positive"

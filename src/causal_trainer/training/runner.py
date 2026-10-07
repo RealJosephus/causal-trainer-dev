@@ -224,6 +224,11 @@ def _validate_supported_config(
         raise ValueError("EndPrompt logical length exceeds the checkpoint's max_position_embeddings")
 
     _validate_memory_options(args, config, mesh)
+    attention_options = getattr(args, "attention_options", None)
+    if attention_options is not None:
+        attention_options.validate_layers(config.num_hidden_layers)
+        if config.num_key_value_heads != 1 or config.attention_dropout != 0.0:
+            raise ValueError("MoBA requires MQA and zero attention dropout")
 
     if mesh.shape["ep"] != 1:
         raise ValueError("this fixed architecture requires ep=1")
@@ -273,7 +278,8 @@ def _validate_supported_config(
         raise ValueError(
             f"total_batch_size={args.total_batch_size} must be divisible by dp*fsdp={data_partitions}"
         )
-    if args.attn_mechanism == "splash":
+    needs_dense_backend = attention_options is None or attention_options.needs_dense_backend
+    if args.attn_mechanism == "splash" and needs_dense_backend:
         from ..modeling.config import validate_splash_block_size
 
         if args.dtype != "bfloat16":
@@ -292,7 +298,7 @@ def _validate_supported_config(
                 f"block_size_q={effective_block_q} must divide the SP-local query length "
                 f"{local_query_length}"
             )
-    elif args.attn_mechanism == "efficient":
+    elif args.attn_mechanism == "efficient" and needs_dense_backend:
         from ..kernels.efficient_attention import resolve_attention_profile
 
         if args.dtype != "bfloat16":
@@ -539,6 +545,8 @@ def _resume_signature_payload(
     )
     arguments = {name: getattr(args, name) for name in argument_names}
     arguments.update(_explicit_memory_options(args))
+    if args.attention_options is not None:
+        arguments["attention_options"] = dataclasses.asdict(args.attention_options)
     payload = {
         "arguments": arguments,
         "dataset_fingerprint": getattr(dataset, "_fingerprint", None),
@@ -1682,6 +1690,8 @@ def main(argv: list[str] | None = None) -> None:
             "external_learning_rate": source_progress_schedule,
         }
         common_step_options.update(_explicit_memory_options(args))
+        if args.attention_options is not None:
+            common_step_options["attention_options"] = args.attention_options
         if args.lora:
             train_step = make_lora_train_step(
                 config,
@@ -2179,6 +2189,11 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 global_batch = training_batch
                 schedule_position = zero_based_step
+            step_position = jnp.asarray(
+                schedule_position, jnp.float32 if source_progress_schedule else jnp.int32,
+            )
+            if args.attention_dense_after_step is not None:
+                step_position = (step_position, jnp.asarray(zero_based_step, jnp.int32))
             with jax.set_mesh(mesh):
                 if args.lora:
                     if lora_params is None:
@@ -2188,10 +2203,7 @@ def main(argv: list[str] | None = None) -> None:
                         lora_params,
                         optimizer_state,
                         global_batch,
-                        jnp.asarray(
-                            schedule_position,
-                            jnp.float32 if source_progress_schedule else jnp.int32,
-                        ),
+                        step_position,
                     )
                 elif full_frozen_components:
                     if full_trainable_params is None:
@@ -2201,20 +2213,14 @@ def main(argv: list[str] | None = None) -> None:
                         full_trainable_params,
                         optimizer_state,
                         global_batch,
-                        jnp.asarray(
-                            schedule_position,
-                            jnp.float32 if source_progress_schedule else jnp.int32,
-                        ),
+                        step_position,
                     )
                 else:
                     params, optimizer_state, device_metrics = train_step(
                         params,
                         optimizer_state,
                         global_batch,
-                        jnp.asarray(
-                            schedule_position,
-                            jnp.float32 if source_progress_schedule else jnp.int32,
-                        ),
+                        step_position,
                     )
             pending_metrics.append((step, device_metrics))
             if args.dataset_streaming:
