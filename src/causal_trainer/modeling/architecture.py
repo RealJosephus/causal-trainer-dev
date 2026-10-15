@@ -671,7 +671,10 @@ def decoder_forward(
             (batch, sequence, config.num_attention_heads, config.head_dim),
             (batch, sequence, config.num_key_value_heads, config.head_dim),
             mesh,
-            **({"compact_statistics": True} if tiled_execution else {}),
+            # Long sequences otherwise replicate each LSE/delta across 128
+            # lanes in HBM. Compact row statistics preserve the same arithmetic
+            # and reduce the measured v4 TP8/SP4 forward+VJP time at 128K/512K.
+            **({"compact_statistics": True} if tiled_execution or sequence >= 131_072 else {}),
         )
         attention_metadata = prepare_attention_metadata(
             canonical_segment_ids,

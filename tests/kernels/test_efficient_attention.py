@@ -85,7 +85,7 @@ def test_compact_statistics_preserves_token_head_order_when_loading_tiles(heads:
 
 
 @pytest.mark.parametrize("compact", [False, True])
-@pytest.mark.parametrize("sequence", [4096, 8192])
+@pytest.mark.parametrize("sequence", [4096, 8192, 524288, 1048576])
 def test_statistics_hbm_shapes_in_forward_and_both_backward_kernels(
     monkeypatch: pytest.MonkeyPatch,
     compact: bool,
@@ -141,6 +141,13 @@ def test_statistics_hbm_shapes_in_forward_and_both_backward_kernels(
     )
     assert [shape.shape for shape in shapes] == [local_shape, local_shape[:3], local_shape, kv_shape, kv_shape]
     assert len(calls) == 3
+    for _, input_shapes in calls:
+        assert input_shapes[0] == (1, 2 * local_shape[1] // profile.block_q)
+        assert input_shapes[1] == (1, 2 * sequence // profile.block_kv_outer)
+    dkv_grid = calls[2][0]["grid_spec"]
+    assert not dkv_grid.scratch_shapes
+    if sequence > 262144:
+        assert all(spec.pipeline_mode.buffer_count == 1 for spec in dkv_grid.out_specs)
     expected = (sequence,) if compact else (*local_shape[:3], 128)
     assert calls[0][0]["out_shape"][1].shape == expected
     for options, input_shapes in calls[1:]:
@@ -221,7 +228,7 @@ def test_compact_pallas_interpreter_packed_forward_and_vjp(
     [
         (4, 8, 256),
         (8, 4, 512),
-        (16, 2, 1024),
+        (16, 2, 512),
     ],
 )
 def test_profiles_derive_query_tiles_from_local_head_count(
@@ -237,7 +244,7 @@ def test_profiles_derive_query_tiles_from_local_head_count(
 
     assert profile.block_h == expected_block_h
     assert profile.block_q == expected_block_q
-    assert profile.block_h * profile.block_q == 2048
+    assert profile.block_h * profile.block_q <= 2048
     assert profile.block_kv_outer == 512
     assert profile.block_kv_compute == 256
 
@@ -316,6 +323,15 @@ def test_profile_resolver_uses_the_sp_local_query_length() -> None:
 
     assert profile.block_h == 8
     assert profile.block_q == 128
+
+
+@pytest.mark.parametrize("compact_statistics", [False, True])
+def test_tp16_very_long_profile_bounds_v4_backward_working_set(compact_statistics: bool) -> None:
+    profile = resolve_attention_profile(
+        (1, 1048576, 32, 128), (1, 1048576, 1, 128), _mesh_shape(tp=16, sp=2),
+        compact_statistics=compact_statistics,
+    )
+    assert profile == AttentionKernelProfile(2, 256, 2048, 512, compact_statistics)
 
 
 @pytest.mark.parametrize(

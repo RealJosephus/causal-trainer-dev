@@ -136,7 +136,7 @@ class TrainingArguments:
     cut_chunk_size: int = 0
     attention_method: str = "dense"
     attention_sparse_backend: str = "auto"
-    attention_query_chunk_size: int = 64
+    attention_query_chunk_size: int = 128
     attention_key_chunk_size: int = 512
     moba_block_size: int = 4096
     moba_top_k: int = 12
@@ -355,7 +355,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add(parser, "attention_sparse_backend", choices=("auto", "pallas", "reference"), default="auto",
          help="Sparse kernel: auto uses Pallas on TPU and the numerical reference on CPU; no TPU fallback.")
     for name, default, help_text in (
-        ("attention_query_chunk_size", 64, "Sparse attention query workspace tile."),
+        ("attention_query_chunk_size", 128,
+         "Sparse attention query workspace tile (bounded by local heads and KV tile)."),
         ("attention_key_chunk_size", 512, "Sparse attention key workspace tile."),
         ("moba_block_size", 4096, "Sample-relative MoBA routing block size."),
         ("moba_top_k", 12, "MoBA block budget per query/head, including its current block."),
@@ -584,13 +585,21 @@ def parse_args(argv: list[str] | None = None) -> TrainingArguments:
             else 0
         )
     if namespace.scan_layers is None:
-        # Full-model TPU measurements show that scanning the 40-layer loop is
-        # shape-dependent: it raises compiled HBM at S8192 but enables the
-        # verified S524288 frontier. Keep LoRA explicit until equivalent
-        # capacity and performance measurements are available.
+        # Extend the long-context default only to the additional full-model
+        # configurations measured on v4: Dense/MoBA 128K and MoBA 256K.
+        # Dense 256K has no paired scan result; LoRA and tiled MLP stay explicit.
+        verified_mid_context = (
+            namespace.attn_mechanism == "efficient"
+            and namespace.total_batch_size == 1
+            and namespace.dtype == namespace.param_dtype == "bfloat16"
+            and (
+                namespace.max_sequence_length == 131072
+                or (namespace.attention_method == "moba" and namespace.max_sequence_length == 262144)
+            )
+        )
         namespace.scan_layers = (
             not namespace.lora
-            and namespace.max_sequence_length >= 524288
+            and (namespace.max_sequence_length >= 524288 or verified_mid_context)
             and namespace.mlp_chunk_size == 0
             and namespace.gradient_checkpointing == "nothing_saveable"
         )

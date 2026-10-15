@@ -9,7 +9,7 @@ from dataclasses import dataclass
 class AttentionOptions:
     method: str = "dense"
     backend: str = "auto"
-    query_chunk_size: int = 64
+    query_chunk_size: int = 128
     key_chunk_size: int = 512
     moba_block_size: int = 4096
     moba_top_k: int = 12

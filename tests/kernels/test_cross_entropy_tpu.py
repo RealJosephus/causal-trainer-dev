@@ -6,7 +6,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from causal_trainer.kernels.cross_entropy import pallas_fused_sparse_cross_entropy
 from causal_trainer.kernels.cut_cross_entropy import pallas_cut_linear_cross_entropy
@@ -162,7 +163,8 @@ def test_chunked_fused_linear_loss_matches_xla_for_hidden_and_head_gradients() -
     )
 
 
-def test_pallas_sparse_skip_preserves_primal_loss_across_inactive_chunks() -> None:
+@pytest.mark.parametrize("pattern", ["trailing", "inactive", "alternating"])
+def test_pallas_sparse_skip_preserves_primal_loss_across_inactive_chunks(pattern: str) -> None:
     # The production token budget gives four sequence chunks here.  Only the
     # first is active, so three consecutive iterations take sparse_skip's false
     # branch.  This guards the TPU buffer-assignment failure that aliased the
@@ -181,8 +183,14 @@ def test_pallas_sparse_skip_preserves_primal_loss_across_inactive_chunks() -> No
         vocab,
         dtype=jnp.int32,
     )
+    positions = jnp.arange(sequence)[None, :]
+    active = {
+        "trailing": positions < 32,
+        "inactive": positions < 0,
+        "alternating": (positions // 32) % 2 == 0,
+    }[pattern]
     weights = jnp.where(
-        jnp.arange(sequence)[None, :] < 32,
+        active,
         jnp.asarray(1.0, jnp.float32),
         jnp.asarray(0.0, jnp.float32),
     )
@@ -229,6 +237,33 @@ def test_pallas_sparse_skip_preserves_primal_loss_across_inactive_chunks() -> No
         rtol=0.0,
         atol=5e-3,
     )
+
+
+def test_pallas_sparse_skip_production_head_and_chunk_count_compile() -> None:
+    # One TP4 host reproduces the per-chip CE shape of B32/S8192/DP8/TP4.
+    # Keep the real 4096x185600 head and 256 chunks: tiny heads conceal the
+    # old conditional residual stack, which exhausted HBM during training.
+    mesh = _mesh()
+    hidden = jax.ShapeDtypeStruct(
+        (4, 8192, 4096), jnp.bfloat16, sharding=NamedSharding(mesh, P(None, None, "tp")),
+    )
+    head = jax.ShapeDtypeStruct(
+        (4096, 185600), jnp.bfloat16, sharding=NamedSharding(mesh, P(None, "tp")),
+    )
+    targets = jax.ShapeDtypeStruct((4, 8192), jnp.int32, sharding=NamedSharding(mesh, P()))
+    weights = jax.ShapeDtypeStruct((4, 8192), jnp.float32, sharding=NamedSharding(mesh, P()))
+
+    def loss(x, w, y, m):
+        nll, count = fused_linear_cross_entropy(
+            x, w, y, m, token_budget=128, implementation="pallas", mesh=mesh, sparse_skip=True,
+        )
+        return nll / jnp.maximum(count, 1.0)
+
+    with jax.set_mesh(mesh):
+        compiled = jax.jit(jax.value_and_grad(loss, argnums=(0, 1))).lower(
+            hidden, head, targets, weights,
+        ).compile()
+    assert compiled.memory_analysis() is not None
 
 
 def _cut_reference(hidden, head, targets, weights):

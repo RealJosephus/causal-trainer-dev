@@ -585,6 +585,31 @@ def test_layer_scan_automatic_selection_is_limited_to_verified_full_long_context
     assert below_threshold.scan_layers is False
 
 
+@pytest.mark.parametrize(("method", "sequence", "expected"), [
+    ("dense", 8192, False), ("dense", 131072, True), ("dense", 262144, False),
+    ("moba", 131072, True), ("moba", 262144, True), ("moba", 262143, False),
+])
+def test_scan_defaults_follow_measured_attention_contexts(method, sequence, expected):
+    args = parse_args([
+        "--repo-id", "local-model", "--dataset-name", "local-data", "--total-batch-size", "1",
+        "--max-sequence-length", str(sequence), "--attention-method", method,
+    ])
+    assert args.scan_layers is expected
+
+
+@pytest.mark.parametrize("extra", [
+    ["--lora"], ["--no-scan-layers"], ["--mlp-chunk-size", "1024"],
+    ["--gradient-checkpointing", "disabled"], ["--total-batch-size", "2"],
+    ["--attn-mechanism", "splash"], ["--dtype", "float32"], ["--param-dtype", "float32"],
+])
+def test_mid_context_scan_keeps_explicit_controls_and_unmeasured_modes(extra):
+    args = parse_args([
+        "--repo-id", "local-model", "--dataset-name", "local-data", "--total-batch-size", "1",
+        "--max-sequence-length", "131072", *extra,
+    ])
+    assert args.scan_layers is False
+
+
 def test_explicit_layer_scan_overrides_automatic_selection() -> None:
     enabled = parse_args(
         [

@@ -192,6 +192,88 @@ def _packed_segments(sequence: int, segment_count: int) -> jax.Array:
     return jnp.asarray(row[None, :], dtype=jnp.int32)
 
 
+@pytest.mark.parametrize(
+    ("sequence", "tp", "sp", "compact_statistics"),
+    [(524288, 1, 4, False), (524288, 2, 2, False),
+     (1048576, 1, 4, True), (1048576, 2, 2, True)],
+)
+def test_real_long_sequence_forward_and_vjp_compile(
+    sequence: int,
+    tp: int,
+    sp: int,
+    compact_statistics: bool,
+) -> None:
+    # H4/TP1/SP4 and H4/TP2/SP2 reproduce the per-chip H32/TP8/SP4
+    # and H32/TP16/SP2 working sets on four local devices. Keep the actual
+    # sequence length: short inputs miss SMEM padding and output buffering.
+    # Compile with abstract inputs only; numerical gates use small sequences.
+    mesh = _local_mesh(tp=tp, sp=sp)
+    query_shape = (1, sequence, 4, _HEAD_DIM)
+    kv_shape = (1, sequence, 1, _HEAD_DIM)
+    query_sharding = NamedSharding(mesh, PartitionSpec(None, "sp", "tp", None))
+    kv_sharding = NamedSharding(mesh, PartitionSpec(None, None, None, None))
+    segment_sharding = NamedSharding(mesh, PartitionSpec(None, "sp"))
+    profile = resolve_attention_profile(
+        query_shape, kv_shape, mesh, compact_statistics=compact_statistics,
+    )
+
+    def run(q, k, v, cotangent, segments):
+        metadata = prepare_attention_metadata(segments, mesh=mesh, profile=profile)
+        return _value_and_vjp(
+            lambda q, k, v: efficient_attention(q, k, v, metadata, mesh=mesh, profile=profile)
+        )(q, k, v, cotangent)
+
+    query = jax.ShapeDtypeStruct(query_shape, jnp.bfloat16, sharding=query_sharding)
+    kv = jax.ShapeDtypeStruct(kv_shape, jnp.bfloat16, sharding=kv_sharding)
+    segments = jax.ShapeDtypeStruct((1, sequence), jnp.int32, sharding=segment_sharding)
+    with jax.set_mesh(mesh):
+        compiled = jax.jit(run).lower(query, kv, kv, query, segments).compile()
+    assert compiled.memory_analysis() is not None
+
+
+@pytest.mark.parametrize(
+    ("query_heads", "target_sequence", "compact_statistics"),
+    [(4, 2048, False), (4, 262144, False), (4, 1048576, False), (4, 1048576, True),
+     (8, 524288, False), (8, 1048576, True)],
+)
+def test_common_and_long_profiles_fit_v4_and_match_vanilla(
+    query_heads: int,
+    target_sequence: int,
+    compact_statistics: bool,
+) -> None:
+    # Local TP2 with H4/H8 has the target H32/TP16 or H32/TP8 tile layout.
+    # Keep multiple KV output windows and an SP-crossing segment without a
+    # quadratic 1M reference. Resolve tiles from the real target length.
+    mesh = _local_mesh(tp=2, sp=2)
+    sequence = 4096 if target_sequence > 262144 else 2048
+    query = _bf16_normal(700, (1, sequence, query_heads, _HEAD_DIM))
+    key = _bf16_normal(701, (1, sequence, 1, _HEAD_DIM))
+    value = _bf16_normal(702, key.shape)
+    cotangent = _bf16_normal(703, query.shape, scale=0.02)
+    segments = jnp.asarray(
+        np.concatenate((np.zeros(97), np.ones(1101), np.full(sequence - 1198, 2)))[None], jnp.int32,
+    )
+    profile = resolve_attention_profile(
+        (1, target_sequence, query_heads, _HEAD_DIM),
+        (1, target_sequence, 1, _HEAD_DIM),
+        mesh,
+        compact_statistics=compact_statistics,
+    )
+    assert profile.block_q == (256 if target_sequence > 262144 else 512)
+    allowed = make_causal_segment_mask(segments != 0, segments)
+    reference = jax.jit(_value_and_vjp(
+        lambda q, k, v: vanilla_attention(q, k, v, allowed, scale=_HEAD_DIM**-0.5)
+    ))(query, key, value, cotangent)
+    with jax.set_mesh(mesh):
+        metadata = prepare_attention_metadata(segments, mesh=mesh, profile=profile)
+        actual = jax.jit(_value_and_vjp(
+            lambda q, k, v: efficient_attention(q, k, v, metadata, mesh=mesh, profile=profile)
+        ))(*_distributed_inputs(mesh, query, key, value, cotangent))
+    _assert_result_matches(actual, reference, actual_name="efficient")
+    for name, result in zip(("out", "dq", "dk", "dv"), actual, strict=True):
+        _assert_exact_zero(name, result, np.asarray(segments == 0))
+
+
 @pytest.mark.parametrize("segment_count", [8, 32])
 @pytest.mark.parametrize("compact_statistics", [False, True])
 def test_rank0_local_tp4_packed_efficient_attention_forward_and_vjp_match_references(

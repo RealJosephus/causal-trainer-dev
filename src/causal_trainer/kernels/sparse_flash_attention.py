@@ -244,6 +244,12 @@ def _local_workspace(q, k, v, info, query_tile, key_tile):
     alignment = 128 // math.gcd(heads, 128)
     query_tile = math.ceil(query_tile / alignment) * alignment
     key_tile = math.ceil(key_tile / 128) * 128
+    # Packed-mask expansion scales with query_tokens * local_heads * key_tile.
+    # A 128-token tile with eight local heads and K512 needs 28.54 MiB of
+    # v4 VMEM. Bound this workspace before padding; Q64/H8/K512 and
+    # Q32/H8/K1024 retain full MXU rows without changing attention semantics.
+    max_query_tile = max(alignment, 262_144 // key_tile // heads // alignment * alignment)
+    query_tile = min(query_tile, max_query_tile)
     padding = -length % query_tile
     q = _pad(q, padding)
     info = tuple(_pad(x, padding) for x in info)
@@ -359,8 +365,10 @@ def sparse_flash_attention(query, key, value, query_info, metadata, *, route, me
     if moba_config is not None:
         from .grouped_moba import local_moba_backward, local_moba_forward
         kwargs.update(block_size=moba_config[0], top_k=moba_config[1])
-        forward = functools.partial(local_moba_forward, **kwargs)
-        backward = functools.partial(local_moba_backward, **kwargs)
+        forward = functools.partial(local_moba_forward, **kwargs, return_routes=True)
+
+        def backward(q, k, v, info, meta, out, lse, routes, do):
+            return local_moba_backward(q, k, v, info, meta, out, lse, do, **kwargs, routes=routes)
     if mesh is not None:
         def axis(*names):
             names = tuple(n for n in names if n in mesh.axis_names and mesh.shape[n] > 1)
@@ -379,9 +387,14 @@ def sparse_flash_attention(query, key, value, query_info, metadata, *, route, me
                 dk, dv = lax.psum((dk, dv), reduction_axes)
             return dq, dk, dv
 
-        forward = jax.shard_map(forward, mesh=mesh, in_specs=specs, out_specs=(q_spec, stat_spec), check_vma=False)
+        # Routes are [selected_rank, batch, sequence, heads]. Keep only the
+        # rank axis replicated; DP/SP/TP follow the query ownership exactly.
+        saved_specs = (q_spec, stat_spec)
+        if moba_config is not None:
+            saved_specs += (P(None, batch, sequence, heads),)
+        forward = jax.shard_map(forward, mesh=mesh, in_specs=specs, out_specs=saved_specs, check_vma=False)
         backward = jax.shard_map(
-            reduce_backward, mesh=mesh, in_specs=(*specs, q_spec, stat_spec, q_spec),
+            reduce_backward, mesh=mesh, in_specs=(*specs, *saved_specs, q_spec),
             out_specs=(q_spec, kv_spec, kv_spec), check_vma=False,
         )
 
@@ -390,8 +403,8 @@ def sparse_flash_attention(query, key, value, query_info, metadata, *, route, me
         return forward(q, k, v, info, meta)[0].astype(q.dtype)
 
     def fwd(q, k, v, info, meta):
-        out, lse = forward(q, k, v, info, meta)
-        return out.astype(q.dtype), (q, k, v, info, meta, out, lse)
+        saved = forward(q, k, v, info, meta)
+        return saved[0].astype(q.dtype), (q, k, v, info, meta, *saved)
 
     def bwd(residual, do):
         q, k, v, *_ = residual

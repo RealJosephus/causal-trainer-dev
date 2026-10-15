@@ -333,8 +333,8 @@ Enable MoBA in addition to the existing training arguments:
 | `attention_sparse_backend` | `auto` | Pallas on TPU, reference on CPU; explicit `pallas` / `reference` overrides. |
 | `moba_block_size` | 4096 | Tokens per sample-relative routing block. |
 | `moba_top_k` | 12 | Maximum selected blocks per Query/head, including the current block. |
-| `attention_query_chunk_size` | 64 | Query workspace tile. Pallas rounds up to fill 128 matrix rows across local heads. |
-| `attention_key_chunk_size` | 512 | KV DMA/softmax tile; Pallas uses 128-aligned tiles. Independent of the routing block size. |
+| `attention_query_chunk_size` | 128 | Query workspace target. Pallas aligns to 128 matrix rows across local heads and bounds the mask workspace; K512 uses at most Q64 with 8 local heads or Q128 with 4. |
+| `attention_key_chunk_size` | 512 | KV workspace target; Pallas uses 128-aligned tiles and may widen grouped history tiles for large local query streams. Independent of the routing block size. |
 | `attention_dense_prefix_layers` | 0 | First layers kept dense. |
 | `attention_dense_suffix_layers` | 0 | Last layers kept dense. |
 | `attention_dense_after_step` | unset | Switch all layers to the chosen dense backend at this zero-based optimizer step. |
@@ -342,6 +342,8 @@ Enable MoBA in addition to the existing training arguments:
 Dashed spellings such as `--attention-method` are also accepted. Dense prefix and suffix counts must fit within the model's layer count. For example, `--attention_dense_suffix_layers 4` retains four dense layers at the end of the model.
 
 **MoBA.** Each sample starts its own block grid. Each Query head selects up to `top_k - 1` completed historical blocks using their mean Keys and includes its current block with a causal mask. One softmax covers all selected tokens. A budget covering the entire sample history recovers dense connections. This follows [MoBA](https://arxiv.org/abs/2502.13189), adapted to shared MQA Keys and Values.
+
+The TPU current-block kernel schedules sample-relative causal intervals in one Pallas grid. Forward query tiles run independently; backward tiles accumulate shared Key/Value gradients in order. Grouped history execution selects its Query/Key tile sizes from the local query-row count while keeping the score workspace bounded. These execution choices preserve the configured routing block size and top-k.
 
 MoBA uses the existing token batch and supports `text`, `messages`, packing, message loss weights, assistant-only loss, EndPrompt position jumps, prepared datasets, and streaming. Full updates, LoRA, frozen components, gradient accumulation, scanning/rematerialization, and loss backends retain their existing behavior and restrictions. Routing follows physical token order and sample boundaries independently of supervision masks.
 
@@ -372,7 +374,7 @@ Available values are:
 - `--projection_chunk_size` controls shard-local token tiling for attention projections and normalization. The default `0` keeps the original projection path. With a positive value, hidden states remain feature-sharded between layers, and `--mlp_chunk_size` independently controls shard-local MLP tile sizes. MLP tiling with `sp>1` requires this projection path.
 - `--remat_group_size` controls the number of decoder layers in each recomputation group. The default `1` keeps the original layer checkpointing. Larger values require `--scan_layers True`, `--gradient_checkpointing nothing_saveable`, and must divide the layer count.
 - `--cut_chunk_size` controls shard-local token chunks for Cut loss, independently of decoder tiling. The default `0` keeps the original Cut execution; positive values require the Cut backend.
-- `--scan_layers` represents the decoder layer loop with `lax.scan`. `--no-scan-layers` selects the unrolled form. When neither is provided, the trainer applies its context-aware default.
+- `--scan_layers` represents the decoder layer loop with `lax.scan`. `--no-scan-layers` selects the unrolled form. Automatic scanning requires full-parameter training, `nothing_saveable` rematerialization and an untiled MLP. It applies at 512K and above, and at 128K (Dense or MoBA) / 256K (MoBA) for BF16 Efficient training with global batch 1. Dense 256K and explicitly tiled runs keep scanning opt-in.
 - `--async_dispatch_steps` controls deferred host synchronization for completed step metrics.
 - `--prefetch_batches` controls prepared global batches retained ahead of the active training step.
 

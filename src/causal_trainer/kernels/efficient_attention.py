@@ -27,6 +27,8 @@ _NUM_LANES = 128
 _NUM_SUBLANES = 8
 _COMMON_PREFERRED_QUERY_ROWS = 2048
 _LONG_PREFERRED_QUERY_ROWS = 1024
+_MAX_QUERY_TOKENS = 512
+_MAX_QUERY_COMPUTE_ELEMENTS = 131_072
 _SUPPORTED_HEAD_DIM = 128
 _DOT_TRANSPOSE_RHS = (((1,), (1,)), ((), ()))
 
@@ -191,11 +193,15 @@ def _nearest_query_tile(
     local_query: int,
     local_heads: int,
     preferred_query_rows: int,
+    max_query_tokens: int = _MAX_QUERY_TOKENS,
 ) -> int:
     target = preferred_query_rows / local_heads
     candidates = tuple(
         block
-        for block in range(_NUM_LANES, local_query + 1, _NUM_LANES)
+        # With few local heads, maximizing logical rows alone creates very
+        # large Q/segment windows and transpose spills. Q1024/H2 needs more
+        # than v4's 16 MiB VMEM in dKV; Q512/H2 passes forward and VJP.
+        for block in range(_NUM_LANES, min(local_query, max_query_tokens) + 1, _NUM_LANES)
         if local_query % block == 0
     )
     if not candidates:
@@ -242,9 +248,12 @@ def resolve_attention_profile(
     else:
         preferred_query_rows = _LONG_PREFERRED_QUERY_ROWS
         preferred_kv_outer, preferred_kv_compute = 2048, 512
-    block_q = _nearest_query_tile(local_query, local_heads, preferred_query_rows)
     block_kv_outer = _largest_aligned_divisor(sequence, preferred_kv_outer)
     block_kv_compute = _largest_aligned_divisor(block_kv_outer, preferred_kv_compute)
+    # Larger KV compute tiles also amplify backward transpose/mask pressure.
+    # Q512/H2/Kc512 exceeds v4 VMEM even with compact statistics; Q256 fits.
+    max_query_tokens = min(_MAX_QUERY_TOKENS, _MAX_QUERY_COMPUTE_ELEMENTS // block_kv_compute)
+    block_q = _nearest_query_tile(local_query, local_heads, preferred_query_rows, max_query_tokens)
     profile = AttentionKernelProfile(
         block_h=local_heads,
         block_q=block_q,
@@ -352,10 +361,14 @@ def _summary_should_run(
     block_kv_outer: int,
     causal: bool,
 ):
-    q_min = q_summary_ref[batch_index, q_block_index, 0]
-    q_max = q_summary_ref[batch_index, q_block_index, 1]
-    kv_min = kv_summary_ref[batch_index, kv_block_index, 0]
-    kv_max = kv_summary_ref[batch_index, kv_block_index, 1]
+    # Pack min/max pairs along the last dimension before scalar prefetch.
+    # [batch, blocks, 2] pads every pair to 128 lanes on v4; at 1M
+    # tokens that alone can exhaust SMEM. [batch, 2 * blocks] retains
+    # random scalar access without a padded lane vector for every block.
+    q_min = q_summary_ref[batch_index, 2 * q_block_index]
+    q_max = q_summary_ref[batch_index, 2 * q_block_index + 1]
+    kv_min = kv_summary_ref[batch_index, 2 * kv_block_index]
+    kv_max = kv_summary_ref[batch_index, 2 * kv_block_index + 1]
     overlap = jnp.logical_and(
         jnp.logical_and(q_min != 0, kv_min != 0),
         jnp.maximum(q_min, kv_min) <= jnp.minimum(q_max, kv_max),
@@ -438,7 +451,9 @@ def _load_row_stat(stat_ref, rows: int) -> Array:
     """
 
     if len(stat_ref.shape) == 1:
-        return lax.broadcast_in_dim(stat_ref[:], (rows, _NUM_LANES), (0,))
+        # Keep compact values in lanes until the native transpose. Direct
+        # row broadcasting lowers to a sublane gather unsupported on TPU v4.
+        return jnp.broadcast_to(stat_ref[:][None, :], (_NUM_LANES, rows)).T
     return stat_ref[0, :, :, :].reshape((rows, _NUM_LANES))
 
 
@@ -683,9 +698,10 @@ def _attention_forward_kernel(
             (block_q, block_h, head_dim)
         ).astype(output_ref.dtype)
         if len(lse_ref.shape) == 1:
-            # All lanes contain the same row statistic. The reduction moves
-            # it into a one-dimensional, densely stored TPU vector layout.
-            lse_ref[:] = jnp.max(lse, axis=-1)
+            # All lanes contain the same statistic. Transpose before selecting
+            # a row so compaction uses a v4-supported native transpose rather
+            # than the sublane gather emitted by a lane reduction/relayout.
+            lse_ref[:] = lse.T[0, :]
         else:
             lse_ref[0, :, :, :] = lse.reshape((block_q, block_h, _NUM_LANES))
 
@@ -851,8 +867,8 @@ def _local_attention_forward(
         ),
         name="causal_trainer_attention_fwd",
     )(
-        local_q_summary,
-        local_kv_summary,
+        local_q_summary.reshape((batch, -1)),
+        local_kv_summary.reshape((batch, -1)),
         offsets,
         scaled_q,
         flat_k,
@@ -1134,8 +1150,8 @@ def _local_attention_dq(
         ),
         name="causal_trainer_attention_dq",
     )(
-        local_q_summary,
-        local_kv_summary,
+        local_q_summary.reshape((batch, -1)),
+        local_kv_summary.reshape((batch, -1)),
         offsets,
         scaled_q,
         flat_k,
@@ -1238,15 +1254,12 @@ def _attention_dkv_kernel(
     delta_ref,
     dk_ref,
     dv_ref,
-    dk_scratch_ref,
-    dv_scratch_ref,
     *,
     block_h: int,
     block_q: int,
     block_kv_outer: int,
     block_kv_compute: int,
     head_blocks: int,
-    q_work_blocks: int,
     causal: bool,
 ):
     batch_index = pl.program_id(0)
@@ -1257,8 +1270,11 @@ def _attention_dkv_kernel(
 
     @pl.when(q_work_index == 0)
     def initialize():
-        dk_scratch_ref[:, :] = jnp.zeros((block_kv_outer, head_dim), jnp.float32)
-        dv_scratch_ref[:, :] = jnp.zeros((block_kv_outer, head_dim), jnp.float32)
+        # The output window stays fixed throughout the arbitrary Q reduction
+        # axis. Accumulate there directly instead of duplicating both FP32
+        # windows in scratch and copying them on the final iteration.
+        dk_ref[:, :] = jnp.zeros((block_kv_outer, head_dim), jnp.float32)
+        dv_ref[:, :] = jnp.zeros((block_kv_outer, head_dim), jnp.float32)
 
     should_run = _summary_should_run(
         q_summary_ref,
@@ -1297,8 +1313,8 @@ def _attention_dkv_kernel(
                     do_ref,
                     delta_ref,
                     offsets_ref,
-                    dk_scratch_ref,
-                    dv_scratch_ref,
+                    dk_ref,
+                    dv_ref,
                     k_ref,
                     v_ref,
                     compute_offset=compute_offset,
@@ -1310,11 +1326,6 @@ def _attention_dkv_kernel(
                     block_kv_compute=block_kv_compute,
                     causal=causal,
                 )
-
-    @pl.when(q_work_index == q_work_blocks - 1)
-    def store():
-        dk_ref[:, :] = dk_scratch_ref[:, :]
-        dv_ref[:, :] = dv_scratch_ref[:, :]
 
 
 def _local_attention_dkv(
@@ -1415,6 +1426,15 @@ def _local_attention_dkv(
         (profile.block_kv_outer, head_dim),
         kv_index_map,
     )
+    dkv_output_spec = pl.BlockSpec(
+        (profile.block_kv_outer, head_dim),
+        kv_index_map,
+        # The 2048-token FP32 windows cost 1 MiB each. At real long
+        # lengths the compiler double-buffers both outputs, even though
+        # each store follows a long Q reduction. Bound those buffers while
+        # retaining ordinary input pipelining and the common-shape schedule.
+        pipeline_mode=pl.Buffered(1) if profile.block_kv_outer > 1024 else None,
+    )
     output_shapes = (
         # These are partial dK/dV values and vary with each local Q shard even
         # though their physical shapes match replicated K/V.  The enclosing
@@ -1430,7 +1450,6 @@ def _local_attention_dkv(
             block_kv_outer=profile.block_kv_outer,
             block_kv_compute=profile.block_kv_compute,
             head_blocks=head_blocks,
-            q_work_blocks=q_work_blocks,
             causal=causal,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1446,11 +1465,7 @@ def _local_attention_dkv(
                 q_spec,
                 stat_spec,
             ),
-            out_specs=(dkv_spec, dkv_spec),
-            scratch_shapes=(
-                pltpu.VMEM((profile.block_kv_outer, head_dim), jnp.float32),
-                pltpu.VMEM((profile.block_kv_outer, head_dim), jnp.float32),
-            ),
+            out_specs=(dkv_output_spec, dkv_output_spec),
         ),
         out_shape=output_shapes,
         compiler_params=pltpu.CompilerParams(
@@ -1458,8 +1473,8 @@ def _local_attention_dkv(
         ),
         name="causal_trainer_attention_dkv",
     )(
-        local_q_summary,
-        local_kv_summary,
+        local_q_summary.reshape((batch, -1)),
+        local_kv_summary.reshape((batch, -1)),
         offsets,
         scaled_q,
         flat_k,

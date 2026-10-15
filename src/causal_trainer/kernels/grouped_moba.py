@@ -371,17 +371,44 @@ def block_routes(q, info, meta, *, top_k, block_size, query_tile=128):
     return jnp.moveaxis(result[:, :length], -1, 0)
 
 
-def local_moba_forward(q, k, v, info, meta, *, route, scale, query_tile, key_tile, block_size, top_k):
-    from .sparse_flash_attention import _local_forward
-    out, lse = _local_forward(q, k, v, info, (), route=route, scale=scale,
-                              query_tile=query_tile, key_tile=key_tile, window_size=block_size)
+def _route_work(info, ranks, block_size):
+    # Canonical sample-relative positions bound the number of historical
+    # blocks independently of Q/K scores and heads. Avoid reading the full
+    # [rank, batch, sequence, head] route tensor in every forward/backward.
+    # All eligible blocks precede the current block, so active ranks form a
+    # prefix. Non-finite scores can shorten that prefix but never extend it.
+    positions, segments, active, starts = info
+    history = jnp.where(active & (segments > 0), (positions - starts) // block_size, 0)
+    counts = jnp.clip(jnp.max(history, axis=1), 0, ranks)
+    if positions.shape[0] == 1:
+        return None, counts[0]
+    active = (jnp.arange(ranks)[:, None] < counts[None, :]).reshape(-1)
+    work = jnp.nonzero(active, size=active.size, fill_value=0)[0]
+    return work, jnp.sum(active, dtype=jnp.int32)
+
+
+def _grouped_tiles(local_rows, block_size, key_tile):
+    key_tile = math.gcd(block_size, max(128, key_tile // 128 * 128))
+    # Large routed streams amortize group padding with fewer Q rows and wider
+    # KV tiles. Keep the score workspace at 262144 elements, and preserve the
+    # smaller-shape schedule and explicit nondefault KV tiles.
+    if local_rows >= 524_288 and key_tile == 512 and block_size % 1024 == 0:
+        return 256, 1024
+    return (512 if local_rows >= 4096 else 128), key_tile
+
+
+def local_moba_forward(q, k, v, info, meta, *, route, scale, query_tile, key_tile, block_size, top_k,
+                       return_routes=False):
+    from .moba_current_block import current_block_forward
+    out, lse = current_block_forward(q, k, v, info, scale=scale,
+                                     query_tile=query_tile, key_tile=key_tile, block_size=block_size)
     routes = block_routes(q, info, meta, top_k=min(top_k, math.ceil(k.shape[1] / block_size)), block_size=block_size)
     scaled = (q * jnp.asarray(scale, q.dtype)).reshape(q.shape[0], -1, 128)
-    key_tile = math.gcd(block_size, max(128, key_tile // 128 * 128))
-    query_rows = 512 if scaled.shape[1] >= 4096 else 128
+    query_rows, key_tile = _grouped_tiles(scaled.shape[1], block_size, key_tile)
+    work, count = _route_work(info, routes.shape[0], block_size)
 
     def body(index, state):
-        rank, b = index // q.shape[0], index % q.shape[0]
+        rank, b = (index, 0) if work is None else (work[index] // q.shape[0], work[index] % q.shape[0])
         groups = routes[rank, b].reshape(-1)
         layout = group_queries(groups, meta[0].shape[1], rows=query_rows)
         part, part_lse = grouped_query(scaled[b], k[b], v[b], meta[1][b, :, 0], layout,
@@ -396,25 +423,30 @@ def local_moba_forward(q, k, v, info, meta, *, route, scale, query_tile, key_til
                 lax.dynamic_update_slice_in_dim(state[1], combined[None], b, axis=0))
 
     if routes.shape[0]:
-        out, lse = lax.fori_loop(0, routes.shape[0] * q.shape[0], body, (out, lse))
-    return out, lse
+        out, lse = lax.fori_loop(0, count, body, (out, lse))
+    # Retain only integer block IDs for the custom VJP. Recomputing the top-k
+    # routing in backward repeats the full tiled Q/mean projection and top-k;
+    # no expanded selected Q/K/V activation needs to be retained.
+    return (out, lse, routes) if return_routes else (out, lse)
 
 
 def local_moba_backward(q, k, v, info, meta, out, lse, do, *, route, scale,
-                        query_tile, key_tile, block_size, top_k):
-    from .sparse_flash_attention import _local_backward
-    grads = _local_backward(q, k, v, info, (), out, lse, do, route=route, scale=scale,
-                             query_tile=query_tile, key_tile=key_tile, window_size=block_size)
-    routes = block_routes(q, info, meta, top_k=min(top_k, math.ceil(k.shape[1] / block_size)), block_size=block_size)
+                        query_tile, key_tile, block_size, top_k, routes=None):
+    from .moba_current_block import current_block_backward
+    grads = current_block_backward(q, k, v, info, out, lse, do, scale=scale,
+                                    query_tile=query_tile, key_tile=key_tile, block_size=block_size)
+    if routes is None:
+        routes = block_routes(q, info, meta, top_k=min(top_k, math.ceil(k.shape[1] / block_size)),
+                              block_size=block_size)
     quantized_scale = jnp.asarray(scale, q.dtype)
     scaled = (q * quantized_scale).reshape(q.shape[0], -1, 128)
     delta = jnp.sum(out * do.astype(jnp.float32), axis=-1).reshape(q.shape[0], -1)
     flat_do, flat_lse = do.reshape(q.shape[0], -1, 128), lse.reshape(q.shape[0], -1)
-    key_tile = math.gcd(block_size, max(128, key_tile // 128 * 128))
-    query_rows = 512 if scaled.shape[1] >= 4096 else 128
+    query_rows, key_tile = _grouped_tiles(scaled.shape[1], block_size, key_tile)
+    work, count = _route_work(info, routes.shape[0], block_size)
 
     def body(index, state):
-        rank, b = index // q.shape[0], index % q.shape[0]
+        rank, b = (index, 0) if work is None else (work[index] // q.shape[0], work[index] % q.shape[0])
         groups = routes[rank, b].reshape(-1)
         layout = group_queries(groups, meta[0].shape[1], rows=query_rows)
         starts = meta[1][b, :, 0]
@@ -428,5 +460,5 @@ def local_moba_backward(q, k, v, info, meta, out, lse, do, *, route, scale,
                 lax.dynamic_update_slice_in_dim(state[2], dvt[None], b, axis=0))
 
     if routes.shape[0]:
-        grads = lax.fori_loop(0, routes.shape[0] * q.shape[0], body, grads)
+        grads = lax.fori_loop(0, count, body, grads)
     return grads

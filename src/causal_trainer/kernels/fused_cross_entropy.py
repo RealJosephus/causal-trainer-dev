@@ -234,37 +234,34 @@ def fused_linear_cross_entropy(
             per_token_nll = xla_fused_sparse_cross_entropy(logits, target_chunk, weight_chunk)
         return jnp.sum(per_token_nll, dtype=jnp.float32)
 
-    evaluated_chunk_nll = jax.checkpoint(
-        compute_chunk_nll,
-        policy=jax.checkpoint_policies.nothing_saveable,
-        prevent_cse=False,
-    )
-
-    def chunk_loss(
+    def chunk_nll(
         hidden_chunk: Array,
         target_chunk: Array,
         weight_chunk: Array,
-    ) -> tuple[Array, Array]:
-        chunk_weight = jnp.sum(weight_chunk, dtype=jnp.float32)
-
+    ) -> Array:
         if sparse_skip:
             # This reduction is over the global SPMD value, so every mesh shard
             # takes the same branch before the nested Pallas shard_map enters TP
             # collectives.  Fully inactive assistant/padding chunks do no LM-head
-            # projection in either forward or backward.  Keep the independently
-            # reduced weight sum outside this conditional: returning both scalar
-            # reductions from a rematerialized conditional can let TPU buffer
-            # assignment alias them on inactive iterations.
-            operands = (hidden_chunk, target_chunk, weight_chunk)
-            chunk_nll = jax.lax.cond(
+            # projection in either forward or backward.
+            return jax.lax.cond(
                 jnp.any(weight_chunk != 0.0),
-                lambda args: evaluated_chunk_nll(*args),
+                lambda args: compute_chunk_nll(*args),
                 lambda _: jnp.asarray(0.0, jnp.float32),
-                operands,
+                (hidden_chunk, target_chunk, weight_chunk),
             )
-        else:
-            chunk_nll = evaluated_chunk_nll(hidden_chunk, target_chunk, weight_chunk)
-        return chunk_nll, chunk_weight
+        return compute_chunk_nll(hidden_chunk, target_chunk, weight_chunk)
+
+    # Rematerialize the conditional as well as its projection. Otherwise AD
+    # saves the head as a branch residual at every scan iteration, turning a
+    # shared [hidden, vocab] parameter into [chunks, hidden, vocab] HBM storage
+    # even when the head is frozen. Saving the inputs of the whole conditional
+    # keeps the head loop-invariant and also skips inactive backward work.
+    evaluated_chunk_nll = jax.checkpoint(
+        chunk_nll,
+        policy=jax.checkpoint_policies.nothing_saveable,
+        prevent_cse=False,
+    )
 
     def accumulate(chunk_index: int, carry: tuple[Array, Array]) -> tuple[Array, Array]:
         start = chunk_index * effective_chunk_size
@@ -286,12 +283,15 @@ def fused_linear_cross_entropy(
             effective_chunk_size,
             axis=1,
         )
-        chunk_nll, chunk_weight = chunk_loss(
+        nll = evaluated_chunk_nll(
             hidden_chunk,
             target_chunk,
             weight_chunk,
         )
-        return carry[0] + chunk_nll, carry[1] + chunk_weight
+        # Keep the weight sum outside the rematerialized conditional: two
+        # scalar results can alias in TPU buffer assignment on inactive tiles.
+        chunk_weight = jnp.sum(weight_chunk, dtype=jnp.float32)
+        return carry[0] + nll, carry[1] + chunk_weight
 
     return jax.lax.fori_loop(
         0,

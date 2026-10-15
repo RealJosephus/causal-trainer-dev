@@ -81,14 +81,15 @@ def test_sparse_method_forward_and_vjp_matches_reference(interpret, method):
         np.testing.assert_allclose(got, expected, rtol=3e-4, atol=3e-6)
 
 
-@pytest.mark.parametrize("top_k", [1, 2, 4])
-def test_grouped_moba_unaligned_packed_blocks_and_global_softmax(interpret, top_k):
+@pytest.mark.parametrize(("top_k", "query_tile"), [(1, 64), (2, 64), (4, 64), (2, 512)])
+def test_grouped_moba_unaligned_packed_blocks_and_global_softmax(interpret, top_k, query_tile):
     rng = np.random.default_rng(996)
     q, k, v, do = (jnp.asarray(rng.normal(scale=0.3, size=shape), jnp.float32) for shape in (
         (1, 448, 2, 128), (1, 448, 1, 128), (1, 448, 1, 128), (1, 448, 2, 128),
     ))
     segments = jnp.asarray([[0] * 3 + [1] * 26 + [2] * 400 + [0] * 19], jnp.int32)
-    options = AttentionOptions(method="moba", backend="pallas", moba_block_size=128, moba_top_k=top_k)
+    options = AttentionOptions(method="moba", backend="pallas", moba_block_size=128, moba_top_k=top_k,
+                               query_chunk_size=query_tile)
 
     def run(options):
         fn = functools.partial(moba_attention, segments=segments, options=options, scale=0.125, mesh=None)
@@ -99,6 +100,108 @@ def test_grouped_moba_unaligned_packed_blocks_and_global_softmax(interpret, top_
     actual = run(options)
     for got, expected in zip(actual, reference, strict=True):
         np.testing.assert_allclose(got, expected, rtol=5e-4, atol=4e-6)
+
+
+def test_grouped_moba_backward_reuses_forward_block_selection(interpret, monkeypatch):
+    from causal_trainer.kernels import grouped_moba
+
+    rng = np.random.default_rng(997)
+    q, k, v = (jnp.asarray(rng.normal(scale=0.2, size=shape), jnp.float32) for shape in (
+        (1, 384, 2, 128), (1, 384, 1, 128), (1, 384, 1, 128),
+    ))
+    segments = jnp.ones((1, 384), jnp.int32)
+    options = AttentionOptions(method="moba", backend="pallas", moba_block_size=128, moba_top_k=2)
+    fn = functools.partial(moba_attention, segments=segments, options=options, scale=0.125, mesh=None)
+    out, pullback = jax.vjp(fn, q, k, v)
+
+    def repeated_selection(*args, **kwargs):
+        raise AssertionError("MoBA backward recomputed forward top-k routes")
+
+    monkeypatch.setattr(grouped_moba, "block_routes", repeated_selection)
+    grads = jax.jit(pullback)(jnp.ones_like(out))
+    assert all(np.isfinite(np.asarray(grad)).all() for grad in grads)
+    assert all(np.any(np.asarray(grad) != 0) for grad in grads)
+
+
+@pytest.mark.parametrize("query_start", [0, 384])
+@pytest.mark.parametrize("key_tile", [128, 512])
+def test_current_block_grid_matches_serial_tiles_with_batch_padding_and_sp_offset(interpret, query_start, key_tile):
+    from causal_trainer.kernels.moba_current_block import current_block_backward, current_block_forward
+    from causal_trainer.modeling.approximate_attention import _positions
+
+    rng = np.random.default_rng(1001)
+    length, local_length, batch, heads = 1153, 519, 3, 2
+    q, k, v, do = (jnp.asarray(rng.normal(scale=0.2, size=shape), jnp.float32) for shape in (
+        (batch, local_length, heads, 128), (batch, length, 128),
+        (batch, length, 128), (batch, local_length, heads, 128),
+    ))
+    segments = jnp.asarray([
+        [0] * 7 + [1] * 300 + [2] * 831 + [0] * 15,
+        [1] * 129 + [2] * 500 + [0] * 524,
+        [0] * length,
+    ], jnp.int32)
+    positions, starts = _positions(segments)
+    info = tuple(x[:, query_start:query_start + local_length]
+                 for x in (positions, segments, segments > 0, starts))
+    kwargs = dict(scale=0.125, query_tile=128, key_tile=key_tile)
+    out, lse = current_block_forward(q, k, v, info, **kwargs, block_size=256)
+    grads = current_block_backward(q, k, v, info, out, lse, do, **kwargs, block_size=256)
+    old_out, old_lse = sparse._local_forward(q, k, v, info, (), **kwargs, route=None, window_size=256)
+    old_grads = sparse._local_backward(q, k, v, info, (), old_out, old_lse, do,
+                                      **kwargs, route=None, window_size=256)
+    for got, expected in zip((out, lse, *grads), (old_out, old_lse, *old_grads), strict=True):
+        np.testing.assert_allclose(got, expected, rtol=2e-5, atol=1e-6)
+        np.testing.assert_array_equal(got[2], 0)
+    np.testing.assert_array_equal(out[np.asarray(~info[2])], 0)
+    np.testing.assert_array_equal(grads[0][np.asarray(~info[2])], 0)
+
+
+@pytest.mark.parametrize("has_history", [False, True])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_grouped_moba_skips_empty_rank_batch_pairs(interpret, monkeypatch, has_history, dtype, batch_size):
+    from causal_trainer.kernels import grouped_moba
+
+    rng = np.random.default_rng(998)
+    q, k, v, do = (jnp.asarray(rng.normal(scale=0.2, size=shape), dtype) for shape in (
+        (batch_size, 512, 2, 128), (batch_size, 512, 1, 128),
+        (batch_size, 512, 1, 128), (batch_size, 512, 2, 128),
+    ))
+    # Batch 0 has no historical block. Batch 1 selects ranks 0 and 1 only,
+    # including an unaligned packed record and padding; rank 2 is always empty.
+    short = [0] * 3 + [1] * 128 + [2] * 128 + [0] * 253
+    long = [0] * 3 + [1] * 274 + [2] * 128 + [0] * 107
+    segments = jnp.asarray([short, long if has_history else [0] * 512] if batch_size == 2
+                           else [long if has_history else short], jnp.int32)
+    options = AttentionOptions(method="moba", backend="pallas", moba_block_size=128, moba_top_k=4)
+    executed = []
+    original = grouped_moba.group_queries
+
+    def observe(groups, *args, **kwargs):
+        # Count executed work, not Python tracing of a loop or conditional.
+        jax.debug.callback(lambda active: executed.append(bool(active)), jnp.any(groups >= 0))
+        return original(groups, *args, **kwargs)
+
+    monkeypatch.setattr(grouped_moba, "group_queries", observe)
+
+    def run(options):
+        @jax.jit
+        def execute(q, k, v, segments):
+            fn = functools.partial(moba_attention, segments=segments, options=options, scale=0.125, mesh=None)
+            out, backward = jax.vjp(fn, q, k, v)
+            return out, *backward(do)
+
+        return jax.block_until_ready(execute(q, k, v, segments))
+
+    expected = run(dataclasses.replace(options, backend="reference"))
+    actual = run(options)
+    jax.effects_barrier()
+    assert executed == [True] * (4 if has_history else 0)
+    for got, want in zip(actual, expected, strict=True):
+        got, want = np.asarray(got, np.float32), np.asarray(want, np.float32)
+        tol = 0.025 if dtype == jnp.bfloat16 else 5e-5
+        assert np.linalg.norm(got - want) / max(np.linalg.norm(want), 1e-12) < tol
+        np.testing.assert_array_equal(got[np.asarray(segments == 0)], 0)
 
 
 @pytest.mark.parametrize("method", ["moba"])
