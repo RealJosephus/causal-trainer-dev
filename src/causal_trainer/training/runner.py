@@ -324,6 +324,7 @@ def _validate_supported_config(
                 config.head_dim,
             ),
             mesh,
+            **({"has_attention_end": True} if args.maskgit_probability else {}),
         )
 
 
@@ -547,6 +548,8 @@ def _resume_signature_payload(
     arguments.update(_explicit_memory_options(args))
     if args.attention_options is not None:
         arguments["attention_options"] = dataclasses.asdict(args.attention_options)
+    if args.maskgit_probability:
+        arguments["maskgit_probability"] = args.maskgit_probability
     payload = {
         "arguments": arguments,
         "dataset_fingerprint": getattr(dataset, "_fingerprint", None),
@@ -858,7 +861,7 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     tokenizer = None
-    if args.dataset_format == "raw":
+    if args.dataset_format == "raw" or args.maskgit_probability:
         tokenizer = TrainingTokenizer.from_directory(processor_source)
         tokenizer.validate_model_vocabulary(config.vocab_size)
         # A tokenizer may intentionally use a padding token distinct from the
@@ -866,6 +869,14 @@ def main(argv: list[str] | None = None) -> None:
         # ID is only a fallback, matching the established training behavior.
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = config.pad_token_id
+
+    maskgit_transform = None
+    if args.maskgit_probability:
+        from ..data.maskgit import MaskGITBatchTransform
+
+        maskgit_transform = MaskGITBatchTransform(
+            tokenizer, probability=args.maskgit_probability, seed=args.seed,
+        )
 
     endprompt = None
     if args.endprompt_enable and args.dataset_format == "raw":
@@ -1683,7 +1694,7 @@ def main(argv: list[str] | None = None) -> None:
             "loss_implementation": loss_implementation,
             "mlp_chunk_size": args.mlp_chunk_size,
             "scan_layers": args.scan_layers,
-            "sparse_loss_skip": dataset_uses_assistant_loss_mask,
+            "sparse_loss_skip": dataset_uses_assistant_loss_mask or bool(args.maskgit_probability),
             "optimizer_state_shardings": optimizer_state_shardings,
             "batch_named_sharding": input_sharding,
             "replicated_named_sharding": scalar_sharding,
@@ -1893,6 +1904,9 @@ def main(argv: list[str] | None = None) -> None:
             ),
         )
 
+        if maskgit_transform is not None:
+            host_batches = maskgit_transform.batches(host_batches, start_step=start_step)
+
         def place_streaming_batch(envelope, *, synchronize: bool):
             placed_data = jax.tree.map(
                 lambda value: host_global_to_array(value, input_sharding),
@@ -1999,6 +2013,8 @@ def main(argv: list[str] | None = None) -> None:
             seed=args.seed,
             start_step=start_step,
         )
+        if maskgit_transform is not None:
+            host_batches = maskgit_transform.batches(host_batches, start_step=start_step)
         batches = prefetch_map(
             host_batches,
             lambda host_batch: jax.tree.map(

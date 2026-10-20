@@ -183,11 +183,12 @@ def test_omitted_mechanism_options_match_explicit_disabled_defaults(monkeypatch)
         "implementation", "mesh", "deterministic", "dropout_rng", "lora_params", "remat_policy",
         "compute_dtype", "block_q", "block_k", "mlp_chunk_size", "gather_kv_projection_weights", "scan_layers",
         "projection_chunk_size", "remat_group_size",
-        "attention_options", "attention_step",
+        "attention_options", "attention_step", "attention_end",
     }
     assert signature(decoder_forward).parameters["attention_options"].default is None
     assert signature(decoder_forward).parameters["attention_step"].default == 0
     for function in (decoder_forward, forward):
+        assert signature(function).parameters["attention_end"].default is None
         assert signature(function).parameters["projection_chunk_size"].default == 0
         assert signature(function).parameters["remat_group_size"].default == 1
 

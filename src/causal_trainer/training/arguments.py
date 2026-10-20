@@ -143,6 +143,7 @@ class TrainingArguments:
     attention_dense_prefix_layers: int = 0
     attention_dense_suffix_layers: int = 0
     attention_dense_after_step: int | None = None
+    maskgit_probability: float = 0.0
 
     @property
     def attention_options(self) -> AttentionOptions | None:
@@ -209,6 +210,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add(parser, "repo_id", required=True, help="Local checkpoint directory or Hugging Face repository ID.")
     _add(parser, "dataset_name", required=True, help="Local dataset file/directory or Hugging Face dataset ID.")
+    _add(
+        parser, "maskgit_probability", type=float, default=0.0,
+        help="Probability per complete assistant image grid of MaskGIT instead of AR training; 0 disables it.",
+    )
     _add(
         parser,
         "dataset_format",
@@ -679,6 +684,13 @@ def parse_args(argv: list[str] | None = None) -> TrainingArguments:
         raise ValueError("learning rates must be non-negative and the initial rate must be positive")
     if args.learning_rate_end > args.learning_rate and args.scheduler != "constant":
         raise ValueError("learning_rate_end cannot exceed learning_rate for a decay schedule")
+    if not math.isfinite(args.maskgit_probability) or not 0.0 <= args.maskgit_probability <= 1.0:
+        raise ValueError("maskgit_probability must be between 0 and 1")
+    if args.maskgit_probability:
+        if args.dataset_format == "raw" and args.dataset_text_field != "messages":
+            raise ValueError("maskgit_probability requires --dataset_text_field messages")
+        if args.attn_mechanism == "splash" or args.attention_method != "dense":
+            raise ValueError("MaskGIT requires dense attention with the efficient or vanilla backend")
     if args.assistant_only_loss and args.last_assistant_only_loss:
         raise ValueError("assistant_only_loss and last_assistant_only_loss are mutually exclusive")
     if (

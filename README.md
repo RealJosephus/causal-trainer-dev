@@ -78,6 +78,61 @@ causal-train \
 
 Assistant-only supervision requires a chat template that marks assistant generation spans with `{% generation %}` and `{% endgeneration %}`. `--assistant_only_loss True` supervises every marked assistant span. Use `--last_assistant_only_loss True` instead to supervise only the final contiguous marked assistant span in each source conversation. The two options are mutually exclusive and require `--dataset_text_field messages`. Records without a valid supervised target after truncation are filtered.
 
+### Mixed AR and MaskGIT image training
+
+The masked-token objective follows [MaskGIT](https://github.com/google-research/maskgit),
+with block-local bidirectional attention inside an otherwise causal conversation.
+
+Add `--maskgit_probability 0.5` to select each supervised assistant image block
+for MaskGIT with probability 0.5; the remaining blocks keep ordinary causal AR
+training. The default is `0.0`, which preserves the existing data and training
+paths. This probability chooses the training objective, not the fraction of
+image tokens to mask.
+
+The tokenizer must already contain single-token `[MASK]`, `<|im_start|>`,
+`<|im_end|>`, and numeric `<|image_i|>` codes (for example, VQ code names
+`<|image_0|>` through `<|image_16383|>`). Code numbers are resolved through the
+tokenizer vocabulary; they are not assumed to equal token IDs or occupy a
+contiguous ID range. Blocks are detected inside ChatML
+`assistant\n` messages. Their width and height come from the actual image codes
+and newline layout, independently of any dimensions in the user prompt.
+Consecutive rows must have equal widths. Other text or a blank line separates
+blocks, so one assistant turn can contain several images. User/input images
+are never corrupted. Unclosed messages, including truncated responses, remain
+AR; preserve the closing `<|im_end|>` in the prepared data. With assistant-only
+preprocessing, include that delimiter in the template's generation span so the
+existing trailing-context trim retains it.
+
+For every selected block and training step, a fresh cosine-distributed masking
+ratio is sampled, with at least one image code masked. Only image codes are
+replaced; newlines stay in the input and receive no prediction loss in the
+MaskGIT block. Masked positions predict their original code at the **same**
+position. Visible image codes receive no reconstruction loss. AR prediction
+edges into/from a selected block are disabled, including its closing boundary
+target. Other text retains the existing next-token objective. Original loss
+weights, assistant-only selection and disabled assistant turns are respected;
+the joint loss uses the existing effective-token-weight normalization.
+
+Each selected block attends bidirectionally within itself and causally to its
+prefix. Prefix tokens cannot read the image, and packed samples cannot read
+one another. Augmentation runs after packing and before device placement, so
+raw/prepared data, streaming, padding, gradient accumulation, full/frozen/LoRA
+training, and sequence sharding share the same batch path. Randomness is
+reproducible from the training seed and absolute optimizer step, including
+resume. No prepared-dataset schema change or offline masking is required.
+
+Use `--attention_method dense` with `--attn_mechanism efficient` for TPU training
+or `vanilla` for a local reference. Splash and MoBA reject this option. The
+Efficient kernel uses O(batch × sequence) visibility metadata, expanded tile
+reachability in forward and both backward kernels, and the existing online
+softmax; it does not materialize a quadratic mask. All existing fused CE
+backends are reused, including Cut, with sparse loss skipping enabled.
+
+Tests cover mixed objectives, packing isolation, training updates, CPU
+interpretation, and TPU execution of the Efficient forward/backward programs
+across sequence shards. Measure memory usage and throughput with the intended
+batch, model and TPU topology.
+
 ## Model and tokenizer sources
 
 `--repo_id` accepts either a local checkpoint directory or a Hugging Face repository ID. Source checkpoints may contain sharded Safetensors weights. The configuration is validated against the architecture supported by this package before parameters are loaded.

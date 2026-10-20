@@ -60,7 +60,9 @@ def _assert_relative_l2(actual, expected, *, limit, floor, label):
     assert error <= limit, f"{label}: relative L2 error {error:.6f} exceeds {limit}"
 
 
-def _assert_full_update_matches_ordinary_scan(*, tp=2, sp=2, sequence=512, intermediate_size=1024, vocab_size=512):
+def _assert_full_update_matches_ordinary_scan(
+    *, tp=2, sp=2, sequence=512, intermediate_size=1024, vocab_size=512, hybrid=False,
+):
     devices = np.asarray(jax.local_devices()[:tp * sp], dtype=object).reshape(1, 1, 1, tp, sp)
     mesh = Mesh(devices, ("dp", "fsdp", "ep", "tp", "sp"))
     config = ModelConfig(
@@ -91,6 +93,23 @@ def _assert_full_update_matches_ordinary_scan(*, tp=2, sp=2, sequence=512, inter
         "input_ids": tokens, "attention_mask": valid, "position_ids": positions,
         "segment_ids": segments, "loss_weights": weights,
     }
+    if hybrid:
+        # A bidirectional island crossing SP shards, plus ordinary AR targets
+        # in the final packed record. This gate exercises the device programs;
+        # ChatML parsing and corruption are covered by the data-path tests.
+        start, end = sequence * 8 // 32, boundaries[2]
+        ends = np.arange(sequence, dtype=np.int32)[None, :].copy()
+        ends[:, start:end] = end - 1
+        targets = np.zeros_like(tokens)
+        targets[:, :-1] = tokens[:, 1:]
+        aligned = np.zeros_like(weights)
+        aligned[:, :-1] = weights[:, 1:] * (segments[:, :-1] == segments[:, 1:])
+        aligned[:, start - 1:end] = 0
+        masked = np.arange(start, end, 2)
+        targets[:, masked] = tokens[:, masked]
+        aligned[:, masked] = weights[:, masked]
+        tokens[:, masked] = vocab_size - 1
+        host_batch.update(attention_end=ends, prediction_targets=targets, prediction_weights=aligned)
     initial_host = _host_tree(init_params(config, jax.random.PRNGKey(23), jnp.bfloat16))
     parameter_shardings = named_shardings(parameter_partition_specs(initial_host), mesh)
     scalar_sharding = replicated_sharding(mesh)
@@ -201,7 +220,8 @@ def test_tp2_sp2_explicit_tiling_packed_full_update_matches_ordinary_scan() -> N
     _assert_full_update_matches_ordinary_scan()
 
 
-def test_cpu_interpreter_tp1_sp4_explicit_tiling_packed_full_update_matches_ordinary_scan(monkeypatch) -> None:
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_cpu_interpreter_tp1_sp4_explicit_tiling_packed_full_update_matches_ordinary_scan(monkeypatch, hybrid) -> None:
     """Check the complete arithmetic path; this does not validate TPU lowering."""
 
     if jax.default_backend() != "cpu" or jax.local_device_count() < 4:
@@ -224,4 +244,6 @@ def test_cpu_interpreter_tp1_sp4_explicit_tiling_packed_full_update_matches_ordi
             module, "shard_map", lambda fn, **kwargs: jax.shard_map(fn, **(kwargs | {"check_vma": False})),
         )
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
-    _assert_full_update_matches_ordinary_scan(tp=1, sp=4, sequence=512, intermediate_size=512, vocab_size=256)
+    _assert_full_update_matches_ordinary_scan(
+        tp=1, sp=4, sequence=512, intermediate_size=512, vocab_size=256, hybrid=hybrid,
+    )

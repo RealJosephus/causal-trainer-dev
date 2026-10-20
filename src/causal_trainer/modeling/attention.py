@@ -67,6 +67,7 @@ def make_causal_segment_mask(attention_mask: Array, segment_ids: Array | None = 
 def _make_causal_segment_mask_precanonicalized(
     attention_mask: Array,
     segment_ids: Array,
+    attention_end: Array | None = None,
 ) -> Array:
     """Build the attention mask from canonical segment IDs."""
 
@@ -80,11 +81,16 @@ def _make_causal_segment_mask_precanonicalized(
     row = jnp.arange(sequence)[:, None]
     column = jnp.arange(sequence)[None, :]
     causal = column <= row
+    if attention_end is not None:
+        ends = jnp.asarray(attention_end, dtype=jnp.int32)
+        if ends.shape != valid.shape:
+            raise ValueError("attention_end must match attention_mask")
+        causal = column[None, :, :] <= ends[:, :, None]
     same_segment = segments[:, :, None] == segments[:, None, :]
     non_padding_segment = segments[:, :, None] != 0
     valid_pairs = valid[:, :, None] & valid[:, None, :]
     return (
-        causal[None, None, :, :]
+        (causal[None, None, :, :] if attention_end is None else causal[:, None, :, :])
         & same_segment[:, None, :, :]
         & non_padding_segment[:, None, :, :]
         & valid_pairs[:, None, :, :]
@@ -359,6 +365,7 @@ def _attention_precanonicalized(
     attention_profile: AttentionKernelProfile | None = None,
     attention_options: AttentionOptions | None = None,
     dense_attention: bool | Array = False,
+    attention_end: Array | None = None,
 ) -> Array:
     """Validate tensors and dispatch using canonical packed segment IDs."""
 
@@ -372,6 +379,12 @@ def _attention_precanonicalized(
     if segments.shape != query.shape[:2]:
         raise ValueError(f"segment_ids must have shape {query.shape[:2]}, got {segments.shape}")
     scale = query.shape[-1] ** -0.5 if scale is None else scale
+
+    if attention_end is not None:
+        if jnp.shape(attention_end) != valid.shape:
+            raise ValueError("attention_end must match attention_mask")
+        if implementation == "splash" or (attention_options is not None and attention_options.method != "dense"):
+            raise ValueError("hybrid attention requires the vanilla or efficient dense backend")
 
     if attention_options is not None and attention_options.method != "dense":
         if key.shape[2] != 1:
@@ -404,12 +417,18 @@ def _attention_precanonicalized(
         if mesh is None:
             raise ValueError("Efficient attention requires the training Mesh")
         profile = (
-            resolve_attention_profile(query.shape, key.shape, mesh)
+            resolve_attention_profile(
+                query.shape, key.shape, mesh,
+                **({"has_attention_end": True} if attention_end is not None else {}),
+            )
             if attention_profile is None
             else attention_profile
         )
         metadata = (
-            prepare_attention_metadata(segments, mesh=mesh, profile=profile)
+            prepare_attention_metadata(
+                segments, mesh=mesh, profile=profile,
+                **({"attention_end": attention_end} if attention_end is not None else {}),
+            )
             if attention_metadata is None
             else attention_metadata
         )
@@ -445,7 +464,7 @@ def _attention_precanonicalized(
         )
         return output * valid[:, :, None, None].astype(output.dtype)
 
-    allowed = _make_causal_segment_mask_precanonicalized(valid, segments)
+    allowed = _make_causal_segment_mask_precanonicalized(valid, segments, attention_end)
     return vanilla_attention(
         query,
         key,
@@ -475,6 +494,7 @@ def attention(
     mesh: Mesh | None = None,
     attention_profile: AttentionKernelProfile | None = None,
     attention_options: AttentionOptions | None = None,
+    attention_end: Array | None = None,
 ) -> Array:
     """Canonicalize packed segments and dispatch to the selected backend."""
 
@@ -496,4 +516,5 @@ def attention(
         mesh=mesh,
         attention_profile=attention_profile,
         attention_options=attention_options,
+        **({"attention_end": attention_end} if attention_end is not None else {}),
     )

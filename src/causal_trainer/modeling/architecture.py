@@ -296,6 +296,7 @@ def _decoder_layer(
     gather_kv_projection_weights: bool,
     attention_options: AttentionOptions | None = None,
     attention_step: int | Array = 0,
+    attention_end: Array | None = None,
 ) -> Array:
     def adapter(block: str, projection: str) -> Params | None:
         if layer_adapters is None:
@@ -376,6 +377,7 @@ def _decoder_layer(
         block_k=block_k,
         attention_metadata=attention_metadata,
         attention_profile=attention_profile,
+        **({"attention_end": attention_end} if attention_end is not None else {}),
         attention_options=attention_options,
         dense_attention=_dense_attention_layer(
             attention_options, layer_index, config.num_hidden_layers, attention_step,
@@ -444,6 +446,7 @@ def _tiled_decoder_layer(
     mlp_chunk_size: int,
     attention_options: AttentionOptions | None = None,
     attention_step: int | Array = 0,
+    attention_end: Array | None = None,
 ) -> Array:
     """Keep sequence/hidden shards across layers; gather only token tiles.
 
@@ -480,6 +483,7 @@ def _tiled_decoder_layer(
         block_k=block_k,
         attention_metadata=attention_metadata,
         attention_profile=attention_profile,
+        **({"attention_end": attention_end} if attention_end is not None else {}),
         attention_options=attention_options,
         dense_attention=_dense_attention_layer(
             attention_options, layer_index, config.num_hidden_layers, attention_step,
@@ -554,6 +558,7 @@ def decoder_forward(
     remat_group_size: int = 1,
     attention_options: AttentionOptions | None = None,
     attention_step: int | Array = 0,
+    attention_end: Array | None = None,
 ) -> Array:
     """Run the decoder and return final normalized hidden states.
 
@@ -664,6 +669,12 @@ def decoder_forward(
     if segment_ids is not None and jnp.shape(segment_ids) != input_ids.shape:
         raise ValueError(f"segment_ids must have shape {input_ids.shape}, got {jnp.shape(segment_ids)}")
     canonical_segment_ids = canonicalize_segment_ids(attention_mask, segment_ids)
+    if attention_end is not None:
+        attention_end = jnp.asarray(attention_end, dtype=jnp.int32)
+        if attention_end.shape != input_ids.shape:
+            raise ValueError("attention_end must match input_ids")
+        if implementation == "splash" or (attention_options is not None and attention_options.method != "dense"):
+            raise ValueError("hybrid attention requires the vanilla or efficient dense backend")
     if implementation == "efficient" and (attention_options is None or attention_options.needs_dense_backend):
         if mesh is None:
             raise ValueError("efficient decoder attention requires the training Mesh")
@@ -675,11 +686,13 @@ def decoder_forward(
             # lanes in HBM. Compact row statistics preserve the same arithmetic
             # and reduce the measured v4 TP8/SP4 forward+VJP time at 128K/512K.
             **({"compact_statistics": True} if tiled_execution or sequence >= 131_072 else {}),
+            **({"has_attention_end": True} if attention_end is not None else {}),
         )
         attention_metadata = prepare_attention_metadata(
             canonical_segment_ids,
             mesh=mesh,
             profile=attention_profile,
+            **({"attention_end": attention_end} if attention_end is not None else {}),
         )
     else:
         attention_profile = None
@@ -740,6 +753,7 @@ def decoder_forward(
         block_q=block_q,
         block_k=block_k,
         attention_profile=attention_profile,
+        **({"attention_end": attention_end} if attention_end is not None else {}),
         mlp_chunk_size=mlp_chunk_size,
         gather_kv_projection_weights=gather_kv_projection_weights,
         attention_options=attention_options,
@@ -754,6 +768,7 @@ def decoder_forward(
             block_q=block_q,
             block_k=block_k,
             attention_profile=attention_profile,
+            **({"attention_end": attention_end} if attention_end is not None else {}),
             chunk_size=projection_chunk_size,
             mlp_chunk_size=mlp_chunk_size,
             attention_options=attention_options,
@@ -872,8 +887,9 @@ def forward(
     remat_group_size: int = 1,
     attention_options: AttentionOptions | None = None,
     attention_step: int | Array = 0,
+    attention_end: Array | None = None,
 ) -> Array:
-    """Return causal language-model logits in ``[batch, sequence, vocab]``."""
+    """Return token logits in ``[batch, sequence, vocab]``; causal by default."""
 
     hidden_states = decoder_forward(
         params,
@@ -898,6 +914,7 @@ def forward(
         remat_group_size=remat_group_size,
         attention_options=attention_options,
         attention_step=attention_step,
+        **({"attention_end": attention_end} if attention_end is not None else {}),
     )
     if config.tie_word_embeddings:
         lm_head = {"kernel": params["embed_tokens"]["embedding"].T}

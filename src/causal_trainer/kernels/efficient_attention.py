@@ -27,6 +27,7 @@ _NUM_LANES = 128
 _NUM_SUBLANES = 8
 _COMMON_PREFERRED_QUERY_ROWS = 2048
 _LONG_PREFERRED_QUERY_ROWS = 1024
+_HYBRID_PREFERRED_QUERY_ROWS = 1024
 _MAX_QUERY_TOKENS = 512
 _MAX_QUERY_COMPUTE_ELEMENTS = 131_072
 _SUPPORTED_HEAD_DIM = 128
@@ -60,12 +61,17 @@ class AttentionKernelProfile:
 
 
 class AttentionMetadata(NamedTuple):
-    """Per-batch packed-attention metadata reused by every decoder layer."""
+    """Packed metadata reused across layers, optionally with per-query end keys.
+
+    End keys are inclusive global sequence indices, independent of RoPE IDs.
+    Hybrid query summaries append the maximum visible end to each min/max pair.
+    """
 
     query_segment_ids: Array
     kv_segment_ids: Array
     q_block_segments: Array
     kv_block_segments: Array
+    attention_end: Array | None = None
 
 
 def _shape_tuple(shape: Sequence[int], name: str) -> tuple[int, ...]:
@@ -232,6 +238,7 @@ def resolve_attention_profile(
     mesh_shape: Mapping[str, int] | Mesh,
     *,
     compact_statistics: bool = False,
+    has_attention_end: bool = False,
 ) -> AttentionKernelProfile:
     """Resolve a static kernel profile from global shapes and named mesh sizes."""
 
@@ -239,6 +246,8 @@ def resolve_attention_profile(
     local_heads = query_shape[2] // tp_size
     local_query = query_shape[1] // sp_size
     sequence = query_shape[1]
+    if not isinstance(has_attention_end, bool):
+        raise TypeError("has_attention_end must be a static bool")
     if sequence <= 16_384:
         preferred_query_rows = _COMMON_PREFERRED_QUERY_ROWS
         preferred_kv_outer, preferred_kv_compute = 512, 256
@@ -248,6 +257,11 @@ def resolve_attention_profile(
     else:
         preferred_query_rows = _LONG_PREFERRED_QUERY_ROWS
         preferred_kv_outer, preferred_kv_compute = 2048, 512
+    if has_attention_end:
+        # Image visibility adds dynamic predicates to all three kernels.
+        # Q512/H4 exceeds v4 VMEM; bound token*head rows independently of
+        # mesh/sequence while preserving the existing causal profiles.
+        preferred_query_rows = min(preferred_query_rows, _HYBRID_PREFERRED_QUERY_ROWS)
     block_kv_outer = _largest_aligned_divisor(sequence, preferred_kv_outer)
     block_kv_compute = _largest_aligned_divisor(block_kv_outer, preferred_kv_compute)
     # Larger KV compute tiles also amplify backward transpose/mask pressure.
@@ -314,6 +328,7 @@ def prepare_attention_metadata(
     *,
     mesh: Mesh,
     profile: AttentionKernelProfile,
+    attention_end: Array | None = None,
 ) -> AttentionMetadata:
     """Build O(S/block) summaries once, immediately before the decoder loop."""
 
@@ -341,11 +356,21 @@ def prepare_attention_metadata(
     def constrain(value: Array, spec_name: str) -> Array:
         return lax.with_sharding_constraint(value, NamedSharding(mesh, specs[spec_name]))
 
+    if attention_end is not None:
+        attention_end = jnp.asarray(attention_end, dtype=jnp.int32)
+        if attention_end.shape != segments.shape:
+            raise ValueError("attention_end must match canonical_segment_ids")
+        ends = jnp.where(segments != 0, attention_end, 0)
+        maximum = ends.reshape(segments.shape[0], -1, block_q).max(axis=-1)
+        q_summary = jnp.concatenate((q_summary, maximum[..., None]), axis=-1)
+        attention_end = constrain(attention_end, "query_segments")
+
     return AttentionMetadata(
         query_segment_ids=constrain(segments, "query_segments"),
         kv_segment_ids=constrain(segments, "kv_segments"),
         q_block_segments=constrain(q_summary, "query_summary"),
         kv_block_segments=constrain(kv_summary, "kv_summary"),
+        attention_end=attention_end,
     )
 
 
@@ -360,13 +385,18 @@ def _summary_should_run(
     block_q: int,
     block_kv_outer: int,
     causal: bool,
+    has_attention_end: bool = False,
 ):
     # Pack min/max pairs along the last dimension before scalar prefetch.
     # [batch, blocks, 2] pads every pair to 128 lanes on v4; at 1M
     # tokens that alone can exhaust SMEM. [batch, 2 * blocks] retains
     # random scalar access without a padded lane vector for every block.
-    q_min = q_summary_ref[batch_index, 2 * q_block_index]
-    q_max = q_summary_ref[batch_index, 2 * q_block_index + 1]
+    if has_attention_end:
+        q_min = q_summary_ref[batch_index, 3 * q_block_index]
+        q_max = q_summary_ref[batch_index, 3 * q_block_index + 1]
+    else:
+        q_min = q_summary_ref[batch_index, 2 * q_block_index]
+        q_max = q_summary_ref[batch_index, 2 * q_block_index + 1]
     kv_min = kv_summary_ref[batch_index, 2 * kv_block_index]
     kv_max = kv_summary_ref[batch_index, 2 * kv_block_index + 1]
     overlap = jnp.logical_and(
@@ -376,6 +406,8 @@ def _summary_should_run(
     if not causal:
         return overlap
     q_global_end = offsets_ref[0] + (q_block_index + 1) * block_q - 1
+    if has_attention_end:
+        q_global_end = q_summary_ref[batch_index, 3 * q_block_index + 2]
     kv_global_start = kv_block_index * block_kv_outer
     return jnp.logical_and(overlap, kv_global_start <= q_global_end)
 
@@ -389,16 +421,28 @@ def _compute_tile_is_causally_reachable(
     block_q: int,
     block_kv_outer: int,
     causal: bool,
+    has_attention_end: bool = False,
+    q_summary_ref=None,
+    batch_index=0,
 ):
     if not causal:
         return jnp.asarray(True)
     q_global_end = offsets_ref[0] + (q_block_index + 1) * block_q - 1
+    if has_attention_end:
+        q_global_end = q_summary_ref[batch_index, 3 * q_block_index + 2]
     kv_global_start = kv_block_index * block_kv_outer + compute_offset
     return kv_global_start <= q_global_end
 
 
-def _q_segment_rows(q_segment_ref, block_h: int) -> Array:
-    q_lanes = q_segment_ref[0, :, :]
+def _q_segment_rows(q_segment_ref, block_h: int, block_q: int, *, offset: int = 0) -> Array:
+    if len(q_segment_ref.shape) == 1:
+        # Hybrid metadata stays compact in HBM and the DMA window. Expand
+        # only the current tile, using the native transpose supported by v4
+        # (direct row broadcasting lowers to an unsupported sublane gather).
+        values = q_segment_ref[pl.ds(offset, block_q)]
+        q_lanes = jnp.broadcast_to(values[None, :], (_NUM_LANES, block_q)).T
+    else:
+        q_lanes = q_segment_ref[0, offset:offset + block_q, :]
     return jnp.broadcast_to(
         q_lanes[:, None, :],
         (q_lanes.shape[0], block_h, _NUM_LANES),
@@ -421,7 +465,22 @@ def _exact_mask(
 ) -> Array:
     rows = block_h * block_q
     repeats = block_kv_compute // _NUM_LANES
-    q_segments = jnp.tile(_q_segment_rows(q_segment_ref, block_h), (1, repeats))
+    if len(q_segment_ref.shape) == 1:
+        # Segment/end predicates are identical for every query head. Compute
+        # them once per token and only repeat the final boolean mask. Repeating
+        # the int32 metadata first spills large registers on TPU v4 at Q512/K512.
+        q_segments = jnp.tile(_q_segment_rows(q_segment_ref, 1, block_q), (1, repeats))
+        kv_segments = kv_segment_ref[0, :1, pl.ds(compute_offset, block_kv_compute)]
+        valid = jnp.logical_and(q_segments != 0, q_segments == kv_segments)
+        if causal:
+            ends = jnp.tile(_q_segment_rows(q_segment_ref, 1, block_q, offset=block_q), (1, repeats))
+            column_ids = lax.broadcasted_iota(jnp.int32, (block_q, block_kv_compute), 1)
+            kv_global = kv_block_index * block_kv_outer + compute_offset + column_ids
+            valid = jnp.logical_and(valid, kv_global <= ends)
+        return jnp.broadcast_to(valid[:, None, :], (block_q, block_h, block_kv_compute)).reshape(
+            (rows, block_kv_compute)
+        )
+    q_segments = jnp.tile(_q_segment_rows(q_segment_ref, block_h, block_q), (1, repeats))
     kv_segments = kv_segment_ref[0, :1, pl.ds(compute_offset, block_kv_compute)]
     valid = jnp.logical_and(q_segments != 0, q_segments == kv_segments)
     if causal:
@@ -593,6 +652,7 @@ def _attention_forward_kernel(
     kv_blocks: int,
     sequence: int,
     causal: bool,
+    has_attention_end: bool = False,
 ):
     batch_index = pl.program_id(0)
     q_block_index = pl.program_id(1)
@@ -616,6 +676,7 @@ def _attention_forward_kernel(
         block_q=block_q,
         block_kv_outer=block_kv_outer,
         causal=causal,
+        has_attention_end=has_attention_end,
     )
 
     @pl.when(should_run)
@@ -652,6 +713,9 @@ def _attention_forward_kernel(
                     block_q=block_q,
                     block_kv_outer=block_kv_outer,
                     causal=causal,
+                    has_attention_end=has_attention_end,
+                    q_summary_ref=q_summary_ref,
+                    batch_index=batch_index,
                 )
             )
             def compute(
@@ -712,6 +776,7 @@ def _forward_index_specs(
     profile: AttentionKernelProfile,
     *,
     causal: bool,
+    has_attention_end: bool = False,
 ):
     batch, query_length, local_heads, head_dim = local_q.shape
     sequence = local_k.shape[1]
@@ -741,6 +806,7 @@ def _forward_index_specs(
             block_q=profile.block_q,
             block_kv_outer=profile.block_kv_outer,
             causal=causal,
+            has_attention_end=has_attention_end,
         )
         selected = lax.select(should_run, kv_block_index, 0)
         return batch_index, 0, selected
@@ -757,6 +823,13 @@ def _forward_index_specs(
             0,
         ),
     )
+    if has_attention_end:
+        q_segment_spec = pl.BlockSpec(
+            (2 * profile.block_q,),
+            lambda batch_index, q_block_index, _head_block_index, _kv_block_index, *_: (
+                batch_index * q_blocks + q_block_index,
+            ),
+        )
     kv_segment_spec = pl.BlockSpec(
         (1, _NUM_SUBLANES, profile.block_kv_outer),
         kv_segment_index_map,
@@ -784,6 +857,35 @@ def _forward_index_specs(
     return grid, q_spec, q_segment_spec, kv_segment_spec, lse_spec
 
 
+def _query_mask_metadata(metadata: AttentionMetadata) -> Array:
+    if metadata.attention_end is None:
+        return metadata.query_segment_ids
+    return jnp.stack((metadata.query_segment_ids, metadata.attention_end), axis=-1)
+
+
+def _query_metadata_lanes(local_metadata: Array, block_q: int) -> Array:
+    """Pack segment/end tiles together without expanding their HBM storage.
+
+    The ordinary causal layout is unchanged. Hybrid tiles contain block_q
+    segment values followed by block_q visibility-end values. A flat array
+    avoids 128-lane HBM padding and large double-buffered VMEM input windows.
+    Sharding happens before this reshape, so images can cross SP boundaries.
+    """
+    batch, sequence = local_metadata.shape[:2]
+    if local_metadata.ndim == 3:
+        local_metadata = local_metadata.reshape(batch, sequence // block_q, block_q, 2)
+        return local_metadata.transpose(0, 1, 3, 2).reshape(-1)
+    return lax.broadcast_in_dim(
+        local_metadata, (*local_metadata.shape, _NUM_LANES), (0, 1),
+    )
+
+
+def _query_summary_input(summary: Array) -> Array:
+    # Flat scalar-prefetch input avoids padding each 2/3-integer record to
+    # 128 lanes in SMEM on TPU v4.
+    return summary.reshape(summary.shape[0], -1)
+
+
 def _local_attention_forward(
     local_q: Array,
     local_k: Array,
@@ -805,11 +907,7 @@ def _local_attention_forward(
     scaled_q = (local_q * scale_bf16).astype(local_q.dtype)
     flat_k = local_k.reshape((batch * sequence, head_dim))
     flat_v = local_v.reshape((batch * sequence, head_dim))
-    q_segment_lanes = lax.broadcast_in_dim(
-        local_q_segments,
-        (batch, query_length, _NUM_LANES),
-        (0, 1),
-    )
+    q_segment_lanes = _query_metadata_lanes(local_q_segments, profile.block_q)
     kv_segment_lanes = lax.broadcast_in_dim(
         local_kv_segments,
         (batch, _NUM_SUBLANES, sequence),
@@ -820,6 +918,7 @@ def _local_attention_forward(
         local_k,
         profile,
         causal=causal,
+        has_attention_end=local_q_segments.ndim == 3,
     )
     output_shape = _output_shape(local_q.shape, local_q.dtype, local_q)
     lse_lane_shape = _output_shape(
@@ -839,6 +938,7 @@ def _local_attention_forward(
             kv_blocks=sequence // profile.block_kv_outer,
             sequence=sequence,
             causal=causal,
+            has_attention_end=local_q_segments.ndim == 3,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
@@ -867,7 +967,7 @@ def _local_attention_forward(
         ),
         name="causal_trainer_attention_fwd",
     )(
-        local_q_summary.reshape((batch, -1)),
+        _query_summary_input(local_q_summary),
         local_kv_summary.reshape((batch, -1)),
         offsets,
         scaled_q,
@@ -975,6 +1075,7 @@ def _attention_dq_kernel(
     sequence: int,
     scale: float,
     causal: bool,
+    has_attention_end: bool = False,
 ):
     batch_index = pl.program_id(0)
     q_block_index = pl.program_id(1)
@@ -996,6 +1097,7 @@ def _attention_dq_kernel(
         block_q=block_q,
         block_kv_outer=block_kv_outer,
         causal=causal,
+        has_attention_end=has_attention_end,
     )
 
     @pl.when(should_run)
@@ -1032,6 +1134,9 @@ def _attention_dq_kernel(
                     block_q=block_q,
                     block_kv_outer=block_kv_outer,
                     causal=causal,
+                    has_attention_end=has_attention_end,
+                    q_summary_ref=q_summary_ref,
+                    batch_index=batch_index,
                 )
             )
             def compute(
@@ -1085,18 +1190,14 @@ def _local_attention_dq(
     scale: float,
     causal: bool,
 ) -> Array:
-    batch, query_length, _local_heads, head_dim = local_q.shape
+    batch, _query_length, _local_heads, head_dim = local_q.shape
     sequence = local_k.shape[1]
     rows = profile.block_q * profile.block_h
     scale_bf16 = jnp.asarray(scale, dtype=local_q.dtype)
     scaled_q = (local_q * scale_bf16).astype(local_q.dtype)
     flat_k = local_k.reshape((batch * sequence, head_dim))
     flat_v = local_v.reshape((batch * sequence, head_dim))
-    q_segment_lanes = lax.broadcast_in_dim(
-        local_q_segments,
-        (batch, query_length, _NUM_LANES),
-        (0, 1),
-    )
+    q_segment_lanes = _query_metadata_lanes(local_q_segments, profile.block_q)
     kv_segment_lanes = lax.broadcast_in_dim(
         local_kv_segments,
         (batch, _NUM_SUBLANES, sequence),
@@ -1109,6 +1210,7 @@ def _local_attention_dq(
         local_k,
         profile,
         causal=causal,
+        has_attention_end=local_q_segments.ndim == 3,
     )
     return pl.pallas_call(
         functools.partial(
@@ -1121,6 +1223,7 @@ def _local_attention_dq(
             sequence=sequence,
             scale=scale,
             causal=causal,
+            has_attention_end=local_q_segments.ndim == 3,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
@@ -1150,7 +1253,7 @@ def _local_attention_dq(
         ),
         name="causal_trainer_attention_dq",
     )(
-        local_q_summary.reshape((batch, -1)),
+        _query_summary_input(local_q_summary),
         local_kv_summary.reshape((batch, -1)),
         offsets,
         scaled_q,
@@ -1261,6 +1364,7 @@ def _attention_dkv_kernel(
     block_kv_compute: int,
     head_blocks: int,
     causal: bool,
+    has_attention_end: bool = False,
 ):
     batch_index = pl.program_id(0)
     kv_block_index = pl.program_id(1)
@@ -1286,6 +1390,7 @@ def _attention_dkv_kernel(
         block_q=block_q,
         block_kv_outer=block_kv_outer,
         causal=causal,
+        has_attention_end=has_attention_end,
     )
 
     @pl.when(should_run)
@@ -1302,6 +1407,9 @@ def _attention_dkv_kernel(
                     block_q=block_q,
                     block_kv_outer=block_kv_outer,
                     causal=causal,
+                    has_attention_end=has_attention_end,
+                    q_summary_ref=q_summary_ref,
+                    batch_index=batch_index,
                 )
             )
             def compute(compute_offset=compute_offset):
@@ -1345,6 +1453,7 @@ def _local_attention_dkv(
     scale: float,
     causal: bool,
 ) -> tuple[Array, Array]:
+    has_attention_end = local_q_segments.ndim == 3
     batch, query_length, local_heads, head_dim = local_q.shape
     sequence = local_k.shape[1]
     head_blocks = local_heads // profile.block_h
@@ -1354,11 +1463,7 @@ def _local_attention_dkv(
     scaled_q = (local_q * scale_bf16).astype(local_q.dtype)
     flat_k = local_k.reshape((batch * sequence, head_dim))
     flat_v = local_v.reshape((batch * sequence, head_dim))
-    q_segment_lanes = lax.broadcast_in_dim(
-        local_q_segments,
-        (batch, query_length, _NUM_LANES),
-        (0, 1),
-    )
+    q_segment_lanes = _query_metadata_lanes(local_q_segments, profile.block_q)
     kv_segment_lanes = lax.broadcast_in_dim(
         local_kv_segments,
         (batch, _NUM_SUBLANES, sequence),
@@ -1392,6 +1497,7 @@ def _local_attention_dkv(
             block_q=profile.block_q,
             block_kv_outer=profile.block_kv_outer,
             causal=causal,
+            has_attention_end=has_attention_end,
         )
         selected = lax.select(should_run, kv_block_index, 0)
         return batch_index, 0, selected
@@ -1408,6 +1514,13 @@ def _local_attention_dkv(
         (1, profile.block_q, _NUM_LANES),
         q_segment_index_map,
     )
+    if has_attention_end:
+        q_segment_spec = pl.BlockSpec(
+            (2 * profile.block_q,),
+            lambda batch_index, _kv_block_index, q_work_index, *_: (
+                batch_index * q_blocks + q_work_index // head_blocks,
+            ),
+        )
     kv_segment_spec = pl.BlockSpec(
         (1, _NUM_SUBLANES, profile.block_kv_outer),
         kv_segment_index_map,
@@ -1451,6 +1564,7 @@ def _local_attention_dkv(
             block_kv_compute=profile.block_kv_compute,
             head_blocks=head_blocks,
             causal=causal,
+            has_attention_end=local_q_segments.ndim == 3,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
@@ -1473,7 +1587,7 @@ def _local_attention_dkv(
         ),
         name="causal_trainer_attention_dkv",
     )(
-        local_q_summary.reshape((batch, -1)),
+        _query_summary_input(local_q_summary),
         local_kv_summary.reshape((batch, -1)),
         offsets,
         scaled_q,
@@ -1572,7 +1686,7 @@ def _distributed_forward(
         query,
         key,
         value,
-        metadata.query_segment_ids,
+        _query_mask_metadata(metadata),
         metadata.kv_segment_ids,
         metadata.q_block_segments,
         metadata.kv_block_segments,
@@ -1680,7 +1794,7 @@ def _distributed_backward(
         query,
         key,
         value,
-        metadata.query_segment_ids,
+        _query_mask_metadata(metadata),
         metadata.kv_segment_ids,
         metadata.q_block_segments,
         metadata.kv_block_segments,
@@ -1760,9 +1874,11 @@ def _validate_metadata(
     expected = {
         "query_segment_ids": (batch, sequence),
         "kv_segment_ids": (batch, sequence),
-        "q_block_segments": (batch, sequence // profile.block_q, 2),
+        "q_block_segments": (batch, sequence // profile.block_q, 3 if metadata.attention_end is not None else 2),
         "kv_block_segments": (batch, sequence // profile.block_kv_outer, 2),
     }
+    if metadata.attention_end is not None:
+        expected["attention_end"] = (batch, sequence)
     for name, shape in expected.items():
         value = getattr(metadata, name)
         if value.shape != shape:
@@ -1819,7 +1935,10 @@ def efficient_attention(
         raise RuntimeError("efficient_attention is available only on TPU")
 
     resolved_profile = (
-        resolve_attention_profile(query_shape, key_shape, mesh)
+        resolve_attention_profile(
+            query_shape, key_shape, mesh,
+            **({"has_attention_end": True} if metadata.attention_end is not None else {}),
+        )
         if profile is None
         else profile
     )

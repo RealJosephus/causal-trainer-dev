@@ -285,6 +285,12 @@ class TrainingTokenizer:
     def __len__(self) -> int:
         return int(self._backend.get_vocab_size(with_added_tokens=True))
 
+    def get_vocab(self) -> dict[str, int]:
+        return self._backend.get_vocab(with_added_tokens=True)
+
+    def decode(self, ids: list[int]) -> str:
+        return self._backend.decode(ids, skip_special_tokens=False)
+
     def _special_token_id(self, name: str) -> int | None:
         override = self._special_token_id_overrides.get(name)
         if override is not None:

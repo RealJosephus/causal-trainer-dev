@@ -165,8 +165,10 @@ def chunked_causal_lm_loss(
     sparse_skip: bool = False,
     lm_head_trainable: bool = True,
     cut_chunk_size: int = 0,
+    prediction_targets: Array | None = None,
+    prediction_weights: Array | None = None,
 ) -> tuple[Array, Array]:
-    """Compute shifted LM loss without materializing full-sequence logits.
+    """Compute causal or explicitly aligned loss without full-sequence logits.
 
     ``token_budget`` bounds local projected token rows independently of the
     local data-parallel batch size. The XLA backend is a reference path, the
@@ -175,6 +177,10 @@ def chunked_causal_lm_loss(
     is static so a frozen LoRA head does not construct a weight-gradient
     kernel. The second result is the effective loss weight sum (equal to a
     token count for ordinary 0/1 masks).
+
+    Optional ``prediction_targets``/``prediction_weights`` are already aligned
+    to hidden-state positions, allowing AR and masked-token tasks in one batch.
+    Omitting them retains the original shifted causal path.
     """
 
     hidden_states = jnp.asarray(hidden_states)
@@ -182,15 +188,27 @@ def chunked_causal_lm_loss(
         raise ValueError("hidden_states must have shape [batch, sequence, hidden]")
     if lm_head_kernel.ndim != 2 or hidden_states.shape[-1] != lm_head_kernel.shape[0]:
         raise ValueError("lm_head_kernel must have shape [hidden, vocab]")
-    targets, weights = _shifted_targets_and_weights(
-        input_ids,
-        attention_mask,
-        segment_ids=segment_ids,
-        assistant_mask=assistant_mask,
-        loss_mask=loss_weights,
-    )
-    loss_hidden_states = hidden_states[:, :-1, :]
-    if mesh is not None and int(mesh.shape.get("sp", 1)) > 1:
+    if (prediction_targets is None) != (prediction_weights is None):
+        raise ValueError("prediction_targets and prediction_weights must be supplied together")
+    if prediction_targets is not None:
+        # Mixed AR/MaskGIT targets are already aligned to query positions. This
+        # reuses all CE backends, including projection-fused Cut, without logits.
+        targets = jnp.asarray(prediction_targets, jnp.int32)
+        weights = jnp.asarray(prediction_weights, jnp.float32)
+        if targets.shape != hidden_states.shape[:2] or weights.shape != targets.shape:
+            raise ValueError("prediction targets/weights must match [batch, sequence]")
+        targets = jnp.where(weights > 0, targets, 0)
+        loss_hidden_states = hidden_states
+    else:
+        targets, weights = _shifted_targets_and_weights(
+            input_ids,
+            attention_mask,
+            segment_ids=segment_ids,
+            assistant_mask=assistant_mask,
+            loss_mask=loss_weights,
+        )
+        loss_hidden_states = hidden_states[:, :-1, :]
+    if prediction_targets is None and mesh is not None and int(mesh.shape.get("sp", 1)) > 1:
         # Keep the global sequence extent SP-divisible. The shifted target at
         # each shard boundary is still formed from the following global token;
         # the final source row is appended with zero weight and contributes no
